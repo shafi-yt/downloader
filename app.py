@@ -3,7 +3,6 @@ from yt_dlp import YoutubeDL
 import os
 import re
 import uuid
-import traceback
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
@@ -16,15 +15,26 @@ def get_video_info(url):
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        # Fix for YouTube API issues
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'skip': ['dash', 'hls']
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Accept-Encoding': 'gzip,deflate',
+            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+            'Connection': 'keep-alive',
+        }
     }
     
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            # Validate URL first
-            try:
-                info = ydl.extract_info(url, download=False)
-            except Exception as e:
-                return {'error': f'Video not accessible: {str(e)}'}
+            info = ydl.extract_info(url, download=False)
             
             formats = []
             for f in info.get('formats', []):
@@ -46,13 +56,13 @@ def get_video_info(url):
                 'thumbnail': info.get('thumbnail', ''),
                 'formats': formats,
                 'uploader': info.get('uploader', 'Unknown Uploader'),
-                'description': info.get('description', '')[:100] + '...' if info.get('description') else ''
+                'view_count': info.get('view_count', 0)
             }
             
             return video_info
             
     except Exception as e:
-        return {'error': f'Failed to fetch video info: {str(e)}'}
+        return {'error': f'Failed to fetch video: {str(e)}'}
 
 @app.route('/')
 def index():
@@ -65,9 +75,13 @@ def get_info():
         if not url:
             return jsonify({'error': 'URL is required'}), 400
         
-        # Basic URL validation
-        if 'youtube.com' not in url and 'youtu.be' not in url:
+        # Enhanced URL validation
+        if not any(domain in url for domain in ['youtube.com', 'youtu.be']):
             return jsonify({'error': 'Please enter a valid YouTube URL'}), 400
+        
+        # Clean URL
+        if '&' in url:
+            url = url.split('&')[0]
         
         video_info = get_video_info(url)
         
@@ -94,6 +108,9 @@ def download():
             'format': format_id,
             'outtmpl': temp_filename + '.%(ext)s',
             'quiet': False,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            }
         }
         
         with YoutubeDL(ydl_opts) as ydl:
@@ -118,14 +135,6 @@ def download():
             
     except Exception as e:
         return f"Download failed: {str(e)}", 500
-
-@app.errorhandler(413)
-def too_large(e):
-    return "File too large", 413
-
-@app.errorhandler(500)
-def internal_error(e):
-    return "Internal server error", 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
