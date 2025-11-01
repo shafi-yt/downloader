@@ -2,10 +2,9 @@ from flask import Flask, request, jsonify
 import os
 import requests
 import yt_dlp
-import tempfile
-import threading
 import time
 import logging
+from threading import Thread
 
 # লগিং সেটআপ
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,8 +14,10 @@ app = Flask(__name__)
 
 # কনফিগারেশন
 BOT_TOKEN = "7628222622:AAHd6XbuWQw1TaurMGu0QWdsJaLF0rIlcj4"
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# লং পোলিং এর জন্য শেষ আপডেট ID
+last_update_id = 0
 
 def is_youtube_url(text):
     """YouTube URL চেক করে"""
@@ -134,48 +135,17 @@ def process_youtube_link(chat_id, youtube_url):
         logger.error(f"Process error: {e}")
         send_telegram_message(chat_id, f"❌ Error: {str(e)}")
 
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "active",
-        "service": "YouTube Telegram Bot",
-        "timestamp": time.time(),
-        "bot_token": BOT_TOKEN[:10] + "..." if BOT_TOKEN else "missing",
-        "endpoints": {
-            "webhook": "/webhook (POST)",
-            "test": "/test (GET)",
-            "set_webhook": "/set_webhook (GET)",
-            "delete_webhook": "/delete_webhook (GET)",
-            "webhook_info": "/webhook_info (GET)"
-        }
-    })
-
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook():
-    """Telegram webhook handler"""
+def handle_message(message):
+    """মেসেজ হ্যান্ডল করে"""
     try:
-        logger.info(f"Webhook received: {request.method}")
-        
-        if request.method == 'GET':
-            return jsonify({"status": "webhook_active", "method": "use POST"})
-        
-        data = request.get_json()
-        logger.info(f"Webhook data: {data}")
-        
-        if not data:
-            logger.warning("No JSON data received")
-            return jsonify({"status": "no data"})
-        
-        # মেসেজ চেক
-        message = data.get('message', {})
         text = message.get('text', '')
         chat_id = message.get('chat', {}).get('id')
         
-        logger.info(f"Message received - chat_id: {chat_id}, text: {text}")
+        logger.info(f"Handling message - chat_id: {chat_id}, text: {text}")
         
         if not chat_id:
             logger.warning("No chat_id found")
-            return jsonify({"status": "invalid message"})
+            return
         
         # কমান্ড হ্যান্ডলিং
         if text.startswith('/'):
@@ -203,12 +173,7 @@ Send me any YouTube link and I will process it for you.
 Just paste a YouTube URL and I'll handle the rest!
                 """.strip()
                 
-                if send_telegram_message(chat_id, welcome_msg):
-                    logger.info("Start command processed successfully")
-                    return jsonify({"status": "welcome sent"})
-                else:
-                    logger.error("Failed to send welcome message")
-                    return jsonify({"status": "send failed"})
+                send_telegram_message(chat_id, welcome_msg)
                     
             elif text == '/help':
                 help_msg = """
@@ -228,102 +193,97 @@ Just paste a YouTube URL and I'll handle the rest!
                 """.strip()
                 
                 send_telegram_message(chat_id, help_msg)
-                return jsonify({"status": "help sent"})
                 
             elif text == '/status':
                 status_msg = "✅ Bot is active and running!"
                 send_telegram_message(chat_id, status_msg)
-                return jsonify({"status": "status sent"})
         
         # YouTube URL প্রসেসিং
-        if is_youtube_url(text):
+        elif is_youtube_url(text):
             logger.info(f"YouTube URL detected: {text}")
             
             # ব্যাকগ্রাউন্ডে প্রসেস শুরু করুন
-            thread = threading.Thread(
+            thread = Thread(
                 target=process_youtube_link, 
                 args=(chat_id, text.strip())
             )
             thread.daemon = True
             thread.start()
-            
-            return jsonify({
-                "status": "processing", 
-                "message": "YouTube link detected and processing started"
-            })
         
         # যদি কোনো কমান্ড বা YouTube URL না হয়
-        if text and not text.startswith('/'):
+        elif text:
             unknown_msg = "❌ Please send a valid YouTube URL or use /help for instructions"
             send_telegram_message(chat_id, unknown_msg)
-        
-        return jsonify({"status": "ignored", "message": "Not a YouTube link or command"})
     
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)})
+        logger.error(f"Message handle error: {e}")
 
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    """Webhook সেটআপ"""
+def get_updates():
+    """Telegram updates পেতে লং পোলিং ব্যবহার করে"""
+    global last_update_id
+    
     try:
-        webhook_url = f"https://{request.host}/webhook"
-        url = f"{TELEGRAM_API_URL}/setWebhook"
-        data = {'url': webhook_url}
+        url = f"{TELEGRAM_API_URL}/getUpdates"
+        params = {
+            'offset': last_update_id + 1,
+            'timeout': 30,
+            'allowed_updates': ['message']
+        }
         
-        logger.info(f"Setting webhook to: {webhook_url}")
-        response = requests.post(url, data=data, timeout=10)
-        result = response.json()
+        response = requests.get(url, params=params, timeout=35)
         
-        logger.info(f"Webhook set result: {result}")
-        
-        return jsonify({
-            "status": "success" if result.get('ok') else "failed",
-            "webhook_url": webhook_url,
-            "result": result
-        })
+        if response.status_code == 200:
+            data = response.json()
+            
+            if data.get('ok') and data.get('result'):
+                for update in data['result']:
+                    last_update_id = update['update_id']
+                    
+                    if 'message' in update:
+                        # নতুন থ্রেডে মেসেজ হ্যান্ডল করুন
+                        thread = Thread(target=handle_message, args=(update['message'],))
+                        thread.daemon = True
+                        thread.start()
+            
+            return True
+        else:
+            logger.error(f"GetUpdates error: {response.status_code}")
+            return False
+            
+    except requests.exceptions.Timeout:
+        # টাইমআউট স্বাভাবিক, শুধু লগ করুন
+        logger.info("GetUpdates timeout (normal)")
+        return True
     except Exception as e:
-        logger.error(f"Webhook set error: {e}")
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
+        logger.error(f"GetUpdates error: {e}")
+        return False
 
-@app.route('/delete_webhook', methods=['GET'])
-def delete_webhook():
-    """Webhook ডিলিট"""
-    try:
-        url = f"{TELEGRAM_API_URL}/deleteWebhook"
-        response = requests.post(url, timeout=10)
-        result = response.json()
-        
-        return jsonify({
-            "status": "success" if result.get('ok') else "failed",
-            "result": result
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
+def polling_worker():
+    """লং পোলিং ওয়ার্কার"""
+    logger.info("Starting Telegram polling worker...")
+    
+    while True:
+        try:
+            if not get_updates():
+                # যদি error হয়, 5 সেকেন্ড অপেক্ষা করুন
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"Polling worker error: {e}")
+            time.sleep(5)
 
-@app.route('/webhook_info', methods=['GET'])
-def webhook_info():
-    """Webhook ইনফো"""
-    try:
-        url = f"{TELEGRAM_API_URL}/getWebhookInfo"
-        response = requests.get(url, timeout=10)
-        result = response.json()
-        
-        return jsonify({
-            "status": "success",
-            "webhook_info": result
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "active",
+        "service": "YouTube Telegram Bot",
+        "timestamp": time.time(),
+        "method": "Long Polling",
+        "endpoints": {
+            "home": "/ (GET)",
+            "test": "/test (GET)",
+            "send_test": "/send_test_message (GET)"
+        }
+    })
 
 @app.route('/test', methods=['GET'])
 def test():
@@ -332,8 +292,7 @@ def test():
         "status": "active",
         "timestamp": time.time(),
         "service": "YouTube Telegram Bot",
-        "bot_token_set": True,
-        "host": request.host
+        "polling": "running"
     })
 
 @app.route('/send_test_message', methods=['GET'])
@@ -354,7 +313,31 @@ def send_test_message():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
+@app.route('/bot_info', methods=['GET'])
+def bot_info():
+    """বট ইনফো"""
+    try:
+        url = f"{TELEGRAM_API_URL}/getMe"
+        response = requests.get(url, timeout=10)
+        result = response.json()
+        
+        return jsonify({
+            "status": "success",
+            "bot_info": result
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        })
+
 if __name__ == '__main__':
+    # লং পোলিং ওয়ার্কার শুরু করুন
+    poll_thread = Thread(target=polling_worker)
+    poll_thread.daemon = True
+    poll_thread.start()
+    
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
+    logger.info("Bot is running with Long Polling method")
     app.run(host='0.0.0.0', port=port, debug=False)
