@@ -5,6 +5,7 @@ import yt_dlp
 import tempfile
 import shutil
 from urllib.parse import urlparse
+import traceback
 
 # --------------------------------
 # Logging Configuration
@@ -17,10 +18,7 @@ logger = logging.getLogger("yt_downloader")
 
 app = Flask(__name__)
 
-# --------------------------------
-# Global Constants
-# --------------------------------
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
 # --------------------------------
@@ -48,33 +46,28 @@ def is_valid_youtube_url(url):
 
 
 def get_video_info(url):
-    """Get video info safely using yt_dlp"""
+    """Fetch video metadata with yt-dlp"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
-        'extract_flat': False,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            if not info:
-                logger.warning("yt-dlp returned None for video info.")
             return info
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp DownloadError: {str(e)}")
-        return None
     except Exception as e:
-        logger.error(f"Video info extraction error: {e}")
+        # Detailed logging
+        error_trace = traceback.format_exc()
+        logger.error(f"Video info extraction failed for {url}: {e}\n{error_trace}")
         return None
 
 
 def download_video(url):
-    """Download video to a temporary folder"""
+    """Download video with yt-dlp"""
     temp_dir = tempfile.mkdtemp()
     ydl_opts = {
         'outtmpl': os.path.join(temp_dir, '%(title).100s.%(ext)s'),
-        # fallback formats, allows mp4/webm
         'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
         'merge_output_format': 'mp4',
         'quiet': True,
@@ -90,11 +83,10 @@ def download_video(url):
                 if file.endswith(('.mp4', '.webm', '.mkv')):
                     video_file = os.path.join(temp_dir, file)
                     break
-            if not video_file:
-                logger.error("No video file found in temp directory.")
             return video_file, info
     except Exception as e:
-        logger.error(f"Download error: {e}")
+        error_trace = traceback.format_exc()
+        logger.error(f"Download error for {url}: {e}\n{error_trace}")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None, None
 
@@ -123,7 +115,7 @@ def format_duration(seconds):
 
 
 # --------------------------------
-# Routes
+# Flask Routes
 # --------------------------------
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
@@ -136,7 +128,7 @@ def handle_request():
                 'example': 'https://your-app.onrender.com/?token=123456:ABC-DEF'
             }), 400
 
-        # Simple GET for Render health display
+        # Health check (GET)
         if request.method == 'GET':
             return jsonify({
                 'status': '✅ YouTube Downloader Bot is running on Render',
@@ -144,12 +136,11 @@ def handle_request():
                 'platform': 'Render'
             })
 
-        # Handle Telegram webhook POST
         update = request.get_json()
         if not update:
             return jsonify({'error': 'Invalid JSON data'}), 400
 
-        logger.info(f"Update received: {update}")
+        logger.info(f"Incoming update: {update}")
 
         message = update.get('message', {})
         chat_id = message.get('chat', {}).get('id')
@@ -157,6 +148,7 @@ def handle_request():
         msg_id = message.get('message_id')
 
         if not chat_id:
+            logger.warning("No chat ID found in update.")
             return jsonify({'error': 'Chat ID missing'}), 400
 
         # START command
@@ -183,24 +175,27 @@ def handle_request():
             )
             return jsonify(send_telegram_message(chat_id, help_msg))
 
-        # YouTube URL check
+        # YouTube Link Handling
         if is_valid_youtube_url(text):
+            logger.info(f"Fetching video info for: {text}")
             info = get_video_info(text)
+
             if not info:
+                logger.warning(f"Failed to fetch info for {text}")
                 return jsonify(send_telegram_message(
                     chat_id,
-                    "❌ ভিডিও তথ্য পাওয়া যায়নি। লিংকটি সঠিক আছে কি না চেক করুন।",
+                    "❌ ভিডিও তথ্য পাওয়া যায়নি। 🔍 লিংকটি সঠিক আছে কি না চেক করুন।",
                     reply_to_message_id=msg_id
                 ))
 
-            # Download process start message
-            logger.info(f"Downloading video: {info.get('title', 'Unknown')}")
+            logger.info(f"Downloading: {info.get('title', 'Unknown Title')}")
             video_file, info = download_video(text)
 
             if not video_file or not os.path.exists(video_file):
+                logger.warning(f"Download failed for {text}")
                 return jsonify(send_telegram_message(
                     chat_id,
-                    "❌ ভিডিও ডাউনলোড ব্যর্থ। ভিডিওটি হয়তো বড় বা প্রাইভেট।",
+                    "❌ ভিডিও ডাউনলোড ব্যর্থ। ভিডিওটি হয়তো বড়, প্রাইভেট, বা রেস্ট্রিক্টেড।",
                     reply_to_message_id=msg_id
                 ))
 
@@ -230,11 +225,11 @@ def handle_request():
                 'reply_to_message_id': msg_id
             }
 
-            # Cleanup
             shutil.rmtree(os.path.dirname(video_file), ignore_errors=True)
+            logger.info(f"Video download success: {info.get('title', 'Unknown')}")
             return jsonify(response)
 
-        # Invalid command
+        # Invalid Input
         return jsonify(send_telegram_message(
             chat_id,
             "❌ অবৈধ ইনপুট। শুধু YouTube লিংক পাঠান অথবা /help লিখুন।",
@@ -242,7 +237,8 @@ def handle_request():
         ))
 
     except Exception as e:
-        logger.exception("Unhandled error:")
+        error_trace = traceback.format_exc()
+        logger.error(f"Unhandled error: {e}\n{error_trace}")
         return jsonify({'error': 'Processing failed', 'details': str(e)}), 500
 
 
@@ -256,6 +252,5 @@ def health_check():
 
 
 if __name__ == '__main__':
-    # works both locally and on Render
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
