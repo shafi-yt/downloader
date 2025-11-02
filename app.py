@@ -1,31 +1,30 @@
 from flask import Flask, request, jsonify
 import os
-import logging
 import yt_dlp
 import tempfile
 import shutil
+import logging
 from urllib.parse import urlparse
-import traceback
 
-# --------------------------------
-# Logging Configuration
-# --------------------------------
+# 🔹 লগ কনফিগারেশন (Render লগে দেখা যাবে)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("yt_downloader")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+# 🔹 সর্বোচ্চ ফাইল সাইজ (50MB)
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
 
-# --------------------------------
-# Helper Functions
-# --------------------------------
+# ──────────────────────────────
+# 🔸 সহায়ক ফাংশনসমূহ
+# ──────────────────────────────
+
 def send_telegram_message(chat_id, text, parse_mode='Markdown', reply_to_message_id=None):
-    """Format Telegram reply JSON"""
+    """Telegram API এর জন্য JSON রেসপন্স তৈরি করে"""
     data = {
         'method': 'sendMessage',
         'chat_id': chat_id,
@@ -38,60 +37,17 @@ def send_telegram_message(chat_id, text, parse_mode='Markdown', reply_to_message
 
 
 def is_valid_youtube_url(url):
+    """YouTube লিংক যাচাই"""
     if not url:
         return False
     parsed = urlparse(url)
-    return any(domain in parsed.netloc for domain in
-               ['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com'])
-
-
-def get_video_info(url):
-    """Fetch video metadata with yt-dlp"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
-    except Exception as e:
-        # Detailed logging
-        error_trace = traceback.format_exc()
-        logger.error(f"Video info extraction failed for {url}: {e}\n{error_trace}")
-        return None
-
-
-def download_video(url):
-    """Download video with yt-dlp"""
-    temp_dir = tempfile.mkdtemp()
-    ydl_opts = {
-        'outtmpl': os.path.join(temp_dir, '%(title).100s.%(ext)s'),
-        'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_file = None
-            for file in os.listdir(temp_dir):
-                if file.endswith(('.mp4', '.webm', '.mkv')):
-                    video_file = os.path.join(temp_dir, file)
-                    break
-            return video_file, info
-    except Exception as e:
-        error_trace = traceback.format_exc()
-        logger.error(f"Download error for {url}: {e}\n{error_trace}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, None
+    return any(domain in parsed.netloc for domain in [
+        'youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com'
+    ])
 
 
 def format_file_size(size_bytes):
+    """ফাইল সাইজ সুন্দরভাবে দেখানো"""
     if size_bytes >= 1024 * 1024:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
     elif size_bytes >= 1024:
@@ -101,8 +57,7 @@ def format_file_size(size_bytes):
 
 
 def format_duration(seconds):
-    if not seconds:
-        return "অজানা"
+    """ভিডিও সময় সুন্দরভাবে দেখানো"""
     if seconds < 60:
         return f"{seconds} সেকেন্ড"
     elif seconds < 3600:
@@ -114,143 +69,149 @@ def format_duration(seconds):
         return f"{hours} ঘন্টা {minutes} মিনিট"
 
 
-# --------------------------------
-# Flask Routes
-# --------------------------------
-@app.route('/', methods=['GET', 'POST'])
-def handle_request():
+# ──────────────────────────────
+# 🔸 yt-dlp ভিত্তিক 360p ডাউনলোড
+# ──────────────────────────────
+
+def download_video_360p(url):
+    """Render-এ 360p ভিডিও ডাউনলোড (FFmpeg ছাড়াই)"""
+    temp_dir = tempfile.mkdtemp(dir="/tmp")
+    logger.info(f"📁 Temporary directory created: {temp_dir}")
+
+    ydl_opts = {
+        "format": "best[height<=360][ext=mp4]",
+        "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+    }
+
     try:
-        token = request.args.get('token')
-        if not token:
-            return jsonify({
-                'error': 'Token required',
-                'solution': 'Add ?token=YOUR_BOT_TOKEN to URL',
-                'example': 'https://your-app.onrender.com/?token=123456:ABC-DEF'
-            }), 400
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-        # Health check (GET)
-        if request.method == 'GET':
-            return jsonify({
-                'status': '✅ YouTube Downloader Bot is running on Render',
-                'max_file_size': '50MB',
-                'platform': 'Render'
-            })
+        if not os.path.exists(filename):
+            logger.error("❌ ভিডিও ফাইল পাওয়া যায়নি।")
+            return None, None
 
+        logger.info(f"✅ ভিডিও ডাউনলোড সম্পূর্ণ: {filename}")
+        return filename, info
+
+    except Exception as e:
+        logger.exception(f"❌ yt-dlp ত্রুটি: {e}")
+        return None, None
+    finally:
+        # ⚠️ Render টেম্প ফাইল ক্লিনআপ করে না, তাই নিজে ম্যানেজ করো
+        logger.info("🧹 Temporary directory ready for cleanup if needed.")
+
+
+# ──────────────────────────────
+# 🔸 Flask Webhook হ্যান্ডলার
+# ──────────────────────────────
+
+@app.route("/", methods=["POST", "GET"])
+def index():
+    if request.method == "GET":
+        return jsonify({
+            "status": "YouTube Downloader Bot running",
+            "max_file_size": "50MB",
+            "platform": "Render"
+        })
+
+    if request.method == "POST":
         update = request.get_json()
         if not update:
-            return jsonify({'error': 'Invalid JSON data'}), 400
+            return jsonify({"error": "Invalid JSON data"}), 400
 
-        logger.info(f"Incoming update: {update}")
+        logger.info(f"📩 Update received: {update}")
 
-        message = update.get('message', {})
-        chat_id = message.get('chat', {}).get('id')
-        text = message.get('text', '')
-        msg_id = message.get('message_id')
+        message = update.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+        text = message.get("text", "")
 
         if not chat_id:
-            logger.warning("No chat ID found in update.")
-            return jsonify({'error': 'Chat ID missing'}), 400
+            return jsonify({"error": "Chat ID not found"}), 400
 
-        # START command
-        if text.startswith('/start'):
-            welcome = (
-                "🎬 *YouTube Downloader Bot*\n\n"
-                "📌 শুধু YouTube লিংক পাঠান — ভিডিও ফেরত পাবেন!\n\n"
-                "⚙️ সীমা:\n"
-                "• সর্বোচ্চ 50MB\n"
-                "• কেবল YouTube ভিডিও সাপোর্ট\n\n"
-                "🚀 শুরু করতে একটি লিংক পাঠান।"
-            )
-            return jsonify(send_telegram_message(chat_id, welcome))
+        # /start কমান্ড
+        if text.startswith("/start"):
+            return jsonify(send_telegram_message(
+                chat_id, "🎬 *YouTube Downloader Bot*\n\nYouTube ভিডিওর লিংক পাঠান এবং বট 360p ভিডিও পাঠাবে।\n\n📦 সর্বোচ্চ সাইজ: 50MB",
+                reply_to_message_id=message_id
+            ))
 
-        # HELP command
-        if text.startswith('/help'):
-            help_msg = (
-                "🆘 *সাহায্য*\n\n"
-                "🎯 শুধু YouTube লিংক পাঠান:\n"
-                "https://youtu.be/VIDEO_ID\n\n"
-                "/start - শুরু\n"
-                "/help - সাহায্য\n\n"
-                "⚡ সীমা: 50MB পর্যন্ত"
-            )
-            return jsonify(send_telegram_message(chat_id, help_msg))
+        # /help কমান্ড
+        if text.startswith("/help"):
+            return jsonify(send_telegram_message(
+                chat_id, "ℹ️ শুধু YouTube ভিডিও লিংক পাঠান। বট 360p ভিডিও পাঠাবে।",
+                reply_to_message_id=message_id
+            ))
 
-        # YouTube Link Handling
+        # YouTube লিংক হ্যান্ডেল
         if is_valid_youtube_url(text):
-            logger.info(f"Fetching video info for: {text}")
-            info = get_video_info(text)
+            processing = send_telegram_message(
+                chat_id, "⏳ ভিডিও ডাউনলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...",
+                reply_to_message_id=message_id
+            )
 
-            if not info:
-                logger.warning(f"Failed to fetch info for {text}")
+            # ডাউনলোড শুরু
+            video_path, info = download_video_360p(text)
+
+            if not video_path:
                 return jsonify(send_telegram_message(
                     chat_id,
                     "❌ ভিডিও তথ্য পাওয়া যায়নি। 🔍 লিংকটি সঠিক আছে কি না চেক করুন।",
-                    reply_to_message_id=msg_id
+                    reply_to_message_id=message_id
                 ))
 
-            logger.info(f"Downloading: {info.get('title', 'Unknown Title')}")
-            video_file, info = download_video(text)
-
-            if not video_file or not os.path.exists(video_file):
-                logger.warning(f"Download failed for {text}")
+            size = os.path.getsize(video_path)
+            if size > MAX_FILE_SIZE:
+                shutil.rmtree(os.path.dirname(video_path), ignore_errors=True)
                 return jsonify(send_telegram_message(
                     chat_id,
-                    "❌ ভিডিও ডাউনলোড ব্যর্থ। ভিডিওটি হয়তো বড়, প্রাইভেট, বা রেস্ট্রিক্টেড।",
-                    reply_to_message_id=msg_id
+                    f"❌ ভিডিওটি খুব বড় ({format_file_size(size)}). সর্বোচ্চ 50MB পর্যন্ত অনুমোদিত।",
+                    reply_to_message_id=message_id
                 ))
 
-            file_size = os.path.getsize(video_file)
-            if file_size > MAX_FILE_SIZE:
-                shutil.rmtree(os.path.dirname(video_file), ignore_errors=True)
-                return jsonify(send_telegram_message(
-                    chat_id,
-                    f"⚠️ ভিডিওটি অনেক বড় ({format_file_size(file_size)}). সর্বোচ্চ 50MB অনুমোদিত।",
-                    reply_to_message_id=msg_id
-                ))
+            caption = f"""
+🎬 *{info.get('title', 'Untitled')}*
+📺 *চ্যানেল:* {info.get('uploader', 'Unknown')}
+⏱️ *সময়:* {format_duration(info.get('duration', 0))}
+📦 *সাইজ:* {format_file_size(size)}
+✅ ডাউনলোড সম্পূর্ণ!
+            """
 
-            caption = (
-                f"🎬 *{info.get('title', 'Unknown Title')}*\n"
-                f"📺 চ্যানেল: {info.get('uploader', 'Unknown')}\n"
-                f"⏱ সময়: {format_duration(info.get('duration', 0))}\n"
-                f"👁️ ভিউ: {info.get('view_count', 0):,}\n"
-                f"📦 সাইজ: {format_file_size(file_size)}\n\n"
-                "✅ @YouTubeDownloaderBot"
-            )
-
+            # Telegram sendVideo মেথড JSON রিটার্ন
             response = {
-                'method': 'sendVideo',
-                'chat_id': chat_id,
-                'caption': caption,
-                'parse_mode': 'Markdown',
-                'reply_to_message_id': msg_id
+                "method": "sendVideo",
+                "chat_id": chat_id,
+                "caption": caption,
+                "parse_mode": "Markdown",
+                "reply_to_message_id": message_id
             }
 
-            shutil.rmtree(os.path.dirname(video_file), ignore_errors=True)
-            logger.info(f"Video download success: {info.get('title', 'Unknown')}")
+            # Render ephemeral storage cleanup
+            shutil.rmtree(os.path.dirname(video_path), ignore_errors=True)
             return jsonify(response)
 
-        # Invalid Input
-        return jsonify(send_telegram_message(
-            chat_id,
-            "❌ অবৈধ ইনপুট। শুধু YouTube লিংক পাঠান অথবা /help লিখুন।",
-            reply_to_message_id=msg_id
-        ))
-
-    except Exception as e:
-        error_trace = traceback.format_exc()
-        logger.error(f"Unhandled error: {e}\n{error_trace}")
-        return jsonify({'error': 'Processing failed', 'details': str(e)}), 500
+        # অন্য ইনপুট হ্যান্ডেল
+        else:
+            return jsonify(send_telegram_message(
+                chat_id,
+                "❌ অনুগ্রহ করে একটি বৈধ YouTube ভিডিও লিংক পাঠান।",
+                reply_to_message_id=message_id
+            ))
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
-        'status': 'healthy',
-        'service': 'YouTube Downloader Bot',
-        'platform': 'Render'
+        "status": "healthy",
+        "service": "YouTube Downloader Bot",
+        "platform": "Render"
     })
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
