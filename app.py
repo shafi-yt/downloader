@@ -9,196 +9,230 @@ from urllib.parse import parse_qs, unquote
 
 app = Flask(__name__)
 
-class SimpleYouTubeDownloader:
+class YouTubeDownloader:
     def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
+        self.session = requests.Session()
     
     def get_video_info(self, video_url):
-        """YouTube video information extract করা - updated for 2024"""
+        """YouTube video information extract using exact VR client"""
         try:
-            response = requests.get(video_url, headers=self.headers, timeout=30)
-            html = response.text
-            
-            # Multiple patterns for player response - updated patterns
-            patterns = [
-                r'var ytInitialPlayerResponse\s*=\s*({.*?});',
-                r'window\["ytInitialPlayerResponse"\]\s*=\s*({.*?});',
-                r'ytInitialPlayerResponse\s*=\s*({.*?});',
-                r'ytInitialData\s*=\s*({.*?});',
-                r'window\["ytInitialData"\]\s*=\s*({.*?});'
-            ]
-            
-            player_response = None
-            for pattern in patterns:
-                match = re.search(pattern, html, re.DOTALL)
-                if match:
-                    try:
-                        player_response = json.loads(match.group(1))
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            
-            if not player_response:
-                # Alternative method: look for embedded data
-                return self._extract_alternative_info(html, video_url)
-            
-            # Try different response structures
-            streaming_data = None
-            video_details = None
-            
-            # Structure 1: Direct player response
-            if 'streamingData' in player_response:
-                streaming_data = player_response.get('streamingData', {})
-                video_details = player_response.get('videoDetails', {})
-            # Structure 2: Nested in contents
-            elif 'contents' in player_response:
-                contents = player_response['contents']
-                if 'twoColumnWatchNextResults' in contents:
-                    # This is ytInitialData, not player response
-                    return self._extract_from_initial_data(player_response, video_url)
-            
-            if not streaming_data:
-                return {"error": "Streaming data not found in response"}
-            
-            return {
-                'title': video_details.get('title', 'video'),
-                'duration': video_details.get('lengthSeconds', '0'),
-                'author': video_details.get('author', 'Unknown'),
-                'formats': self._parse_formats(streaming_data)
-            }
-            
-        except Exception as e:
-            return {"error": f"Failed to get video info: {str(e)}"}
-    
-    def _extract_alternative_info(self, html, video_url):
-        """Alternative method to extract video info"""
-        try:
-            # Extract from ytInitialData
-            pattern = r'var ytInitialData\s*=\s*({.*?});'
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                initial_data = json.loads(match.group(1))
-                return self._extract_from_initial_data(initial_data, video_url)
-            
-            # Try to find video title from HTML
-            title_match = re.search(r'<title>(.*?)</title>', html)
-            title = title_match.group(1).replace(' - YouTube', '') if title_match else 'video'
-            
-            return {
-                'title': title,
-                'duration': '0',
-                'author': 'Unknown',
-                'formats': [],
-                'error': 'Could not extract full video info'
-            }
-            
-        except Exception as e:
-            return {"error": f"Alternative extraction failed: {str(e)}"}
-    
-    def _extract_from_initial_data(self, initial_data, video_url):
-        """Extract info from ytInitialData"""
-        try:
-            # Complex extraction from initial data structure
-            video_info = {
-                'title': 'video',
-                'duration': '0',
-                'author': 'Unknown',
-                'formats': []
-            }
-            
-            # Extract title
-            if 'contents' in initial_data:
-                contents = initial_data['contents']
-                if 'twoColumnWatchNextResults' in contents:
-                    results = contents['twoColumnWatchNextResults']
-                    if 'results' in results and 'results' in results['results']:
-                        for item in results['results']['results']['contents']:
-                            if 'videoPrimaryInfoRenderer' in item:
-                                title_element = item['videoPrimaryInfoRenderer'].get('title', {})
-                                if 'runs' in title_element and len(title_element['runs']) > 0:
-                                    video_info['title'] = title_element['runs'][0]['text']
-                            
-                            if 'videoSecondaryInfoRenderer' in item:
-                                author_element = item['videoSecondaryInfoRenderer'].get('owner', {})
-                                if 'videoOwnerRenderer' in author_element:
-                                    author_name = author_element['videoOwnerRenderer'].get('title', {})
-                                    if 'runs' in author_name and len(author_name['runs']) > 0:
-                                        video_info['author'] = author_name['runs'][0]['text']
-            
-            # Get formats using innerTube API
-            formats_result = self._get_formats_via_inner_tube(video_url)
-            if 'formats' in formats_result:
-                video_info['formats'] = formats_result['formats']
-            elif 'error' in formats_result:
-                video_info['error'] = formats_result['error']
-            
-            return video_info
-            
-        except Exception as e:
-            return {"error": f"Initial data extraction failed: {str(e)}"}
-    
-    def _get_formats_via_inner_tube(self, video_url):
-        """Get formats using innerTube API"""
-        try:
-            # Extract video ID
             video_id = self._extract_video_id(video_url)
             if not video_id:
-                return {"error": "Could not extract video ID"}
+                return {"error": "Could not extract video ID from URL"}
             
-            # Use innertube API
-            innertube_url = "https://www.youtube.com/youtubei/v1/player"
+            # Use the exact innerTube API as in your request
+            innertube_url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
             
+            # Exact payload matching your request
             payload = {
                 "context": {
                     "client": {
-                        "clientName": "ANDROID",
-                        "clientVersion": "19.08.35",
-                        "androidSdkVersion": 30,
+                        "clientName": "ANDROID_VR",
+                        "clientVersion": "1.65.10",
+                        "userAgent": "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                        "deviceMake": "Oculus",
+                        "deviceModel": "Quest 3",
+                        "androidSdkVersion": 32,
                         "osName": "Android",
-                        "osVersion": "11"
+                        "osVersion": "12L",
+                        "hl": "en"
                     }
                 },
                 "videoId": video_id,
-                "params": "CgIQBg==",
-                "playbackContext": {
-                    "contentPlaybackContext": {
-                        "html5Preference": "HTML5_PREF_WANTS"
-                    }
-                },
                 "contentCheckOk": True,
                 "racyCheckOk": True
             }
             
+            # Exact headers matching your request
             headers = {
-                'User-Agent': 'com.google.android.youtube/19.08.35 (Linux; U; Android 11) gzip',
-                'Content-Type': 'application/json',
-                'X-YouTube-Client-Name': '3',
-                'X-YouTube-Client-Version': '19.08.35'
+                'User-Agent': "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                'Connection': "Keep-Alive",
+                'Accept-Encoding': "gzip",
+                'Content-Type': "application/json",
+                'Origin': "https://www.youtube.com",
+                'X-Youtube-Client-Name': "28",
+                'X-Goog-Visitor-Id': "CgtBbW11S29OVGNvNCi9tKbIBjIKCgJCRBIEGgAgYg%3D%3D",
+                'X-Youtube-Client-Version': "1.65.10"
             }
             
-            response = requests.post(innertube_url, json=payload, headers=headers, timeout=30)
-            response_data = response.json()
+            print(f"Making API request for video ID: {video_id}")
+            response = self.session.post(innertube_url, json=payload, headers=headers, timeout=30)
             
-            if 'streamingData' in response_data:
-                return {
-                    'formats': self._parse_formats(response_data['streamingData'])
-                }
-            else:
-                return {"error": "No streaming data in API response"}
-                
+            if response.status_code != 200:
+                return {"error": f"API request failed with status {response.status_code}: {response.text}"}
+            
+            response_data = response.json()
+            print(f"API Response received successfully")
+            
+            # Parse the response
+            return self._parse_player_response(response_data)
+            
         except Exception as e:
-            return {"error": f"InnerTube API failed: {str(e)}"}
+            return {"error": f"Failed to get video info: {str(e)}"}
+    
+    def _parse_player_response(self, response_data):
+        """Parse the player response"""
+        try:
+            # Check if response has playability status
+            playability_status = response_data.get('playabilityStatus', {})
+            status = playability_status.get('status', 'UNKNOWN')
+            
+            if status != 'OK':
+                error_reason = playability_status.get('reason', 'Video not playable')
+                return {"error": f"Video not playable: {error_reason}"}
+            
+            # Extract video details
+            video_details = response_data.get('videoDetails', {})
+            streaming_data = response_data.get('streamingData', {})
+            
+            if not streaming_data:
+                return {"error": "No streaming data available"}
+            
+            # Parse formats
+            formats = self._parse_streaming_data(streaming_data)
+            
+            if not formats:
+                return {"error": "No downloadable formats found"}
+            
+            result = {
+                'title': video_details.get('title', 'Unknown Title'),
+                'duration': video_details.get('lengthSeconds', '0'),
+                'author': video_details.get('author', 'Unknown Channel'),
+                'viewCount': video_details.get('viewCount', '0'),
+                'thumbnail': self._get_best_thumbnail(video_details.get('thumbnail', {})),
+                'formats': formats,
+                'videoId': video_details.get('videoId', ''),
+                'playabilityStatus': status
+            }
+            
+            print(f"Found {len(formats)} formats for video: {result['title']}")
+            return result
+            
+        except Exception as e:
+            return {"error": f"Failed to parse response: {str(e)}"}
+    
+    def _get_best_thumbnail(self, thumbnail_data):
+        """Get the highest quality thumbnail"""
+        thumbnails = thumbnail_data.get('thumbnails', [])
+        if thumbnails:
+            # Return the last (highest quality) thumbnail
+            return thumbnails[-1].get('url', '')
+        return ''
+    
+    def _parse_streaming_data(self, streaming_data):
+        """Parse streaming data from response"""
+        formats = []
+        
+        # Combined formats (video + audio)
+        combined_formats = streaming_data.get('formats', [])
+        # Adaptive formats (separate video/audio)
+        adaptive_formats = streaming_data.get('adaptiveFormats', [])
+        
+        all_formats = combined_formats + adaptive_formats
+        
+        for fmt in all_formats:
+            format_info = self._extract_format_details(fmt)
+            if format_info and format_info.get('url'):
+                formats.append(format_info)
+        
+        # Sort by quality (highest first)
+        formats.sort(key=lambda x: (
+            x.get('hasVideo', False),
+            x.get('height', 0),
+            x.get('bitrate', 0)
+        ), reverse=True)
+        
+        return formats
+    
+    def _extract_format_details(self, fmt):
+        """Extract detailed format information"""
+        try:
+            mime_type = fmt.get('mimeType', '')
+            itag = fmt.get('itag')
+            
+            # Get quality label
+            quality_label = fmt.get('qualityLabel', '')
+            if not quality_label and 'video' in mime_type:
+                height = fmt.get('height', 0)
+                if height:
+                    quality_label = f"{height}p"
+            
+            # Determine format type
+            has_video = 'video' in mime_type
+            has_audio = 'audio' in mime_type
+            
+            # Get download URL
+            download_url = fmt.get('url', '')
+            
+            # Handle signature cipher if present
+            if 'signatureCipher' in fmt:
+                cipher_data = self._decode_signature_cipher(fmt['signatureCipher'])
+                download_url = cipher_data.get('url', '')
+            
+            if not download_url:
+                return None
+            
+            # Calculate approximate file size
+            content_length = fmt.get('contentLength')
+            file_size = self._format_file_size(content_length) if content_length else 'Unknown'
+            
+            format_info = {
+                'itag': itag,
+                'url': download_url,
+                'mimeType': mime_type,
+                'quality': quality_label,
+                'bitrate': fmt.get('bitrate', 0),
+                'width': fmt.get('width', 0),
+                'height': fmt.get('height', 0),
+                'contentLength': content_length,
+                'fileSize': file_size,
+                'hasVideo': has_video,
+                'hasAudio': has_audio,
+                'type': 'video+audio' if has_video and has_audio else 'video' if has_video else 'audio',
+                'fps': fmt.get('fps', 0),
+                'qualityOrdinal': fmt.get('qualityOrdinal', '')
+            }
+            
+            return format_info
+            
+        except Exception as e:
+            print(f"Error extracting format details: {e}")
+            return None
+    
+    def _format_file_size(self, size_bytes):
+        """Format file size in human readable format"""
+        try:
+            size_bytes = int(size_bytes)
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if size_bytes < 1024.0:
+                    return f"{size_bytes:.1f} {unit}"
+                size_bytes /= 1024.0
+            return f"{size_bytes:.1f} TB"
+        except:
+            return "Unknown"
+    
+    def _decode_signature_cipher(self, cipher_string):
+        """Decode signature cipher to get actual URL"""
+        try:
+            params = {}
+            for item in cipher_string.split('&'):
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    params[key] = unquote(value)
+            
+            url = params.get('url', '')
+            signature = params.get('s', '')
+            
+            if url and signature:
+                # For now, return the URL without signature (will work for some videos)
+                return {'url': url}
+            
+            return {'url': url}
+        except:
+            return {'url': ''}
     
     def _extract_video_id(self, url):
-        """Extract video ID from YouTube URL"""
+        """Extract video ID from various YouTube URL formats"""
         patterns = [
             r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
             r'(?:embed\/)([0-9A-Za-z_-]{11})',
@@ -211,122 +245,108 @@ class SimpleYouTubeDownloader:
                 return match.group(1)
         return None
     
-    def _parse_formats(self, streaming_data):
-        """Available formats parse করা"""
-        formats = []
-        
-        if not streaming_data:
-            return formats
-        
-        # Combined formats (video + audio)
-        combined_formats = streaming_data.get('formats', [])
-        # Adaptive formats (video/audio separate)
-        adaptive_formats = streaming_data.get('adaptiveFormats', [])
-        
-        all_formats = combined_formats + adaptive_formats
-        
-        for fmt in all_formats:
-            format_info = self._extract_format_info(fmt)
-            if format_info and format_info.get('url'):
-                formats.append(format_info)
-        
-        return formats
-    
-    def _extract_format_info(self, fmt):
-        """Individual format information extract করা"""
-        mime_type = fmt.get('mimeType', '')
-        quality_label = fmt.get('qualityLabel', '')
-        
-        if not quality_label and 'video' in mime_type:
-            if fmt.get('height'):
-                quality_label = f"{fmt.get('height')}p"
-        
-        format_info = {
-            'itag': fmt.get('itag'),
-            'url': fmt.get('url', ''),
-            'mimeType': mime_type,
-            'quality': quality_label,
-            'bitrate': fmt.get('bitrate', 0),
-            'width': fmt.get('width', 0),
-            'height': fmt.get('height', 0),
-            'contentLength': fmt.get('contentLength', '0'),
-            'hasVideo': 'video' in mime_type,
-            'hasAudio': 'audio' in mime_type,
-        }
-        
-        # Handle signature cipher
-        if 'signatureCipher' in fmt:
-            cipher_data = self._parse_signature_cipher(fmt['signatureCipher'])
-            format_info.update(cipher_data)
-        
-        return format_info
-    
-    def _parse_signature_cipher(self, cipher_string):
-        """Signature cipher decode করা"""
+    def download_video(self, download_url, filename):
+        """Download video to temporary file"""
         try:
-            params = {}
-            for item in cipher_string.split('&'):
-                if '=' in item:
-                    key, value = item.split('=', 1)
-                    params[key] = unquote(value)
+            # Create temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             
-            return {
-                'url': params.get('url', ''),
-                's': params.get('s', ''),
-                'sp': params.get('sp', 'signature')
+            # Download headers
+            headers = {
+                'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+                'Range': 'bytes=0-',
+                'Accept': '*/*',
+                'Accept-Encoding': 'identity',
+                'Connection': 'keep-alive'
             }
-        except:
-            return {}
+            
+            print(f"Starting download from: {download_url[:100]}...")
+            
+            # Stream download
+            response = self.session.get(download_url, headers=headers, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            # Download file
+            total_size = 0
+            content_length = response.headers.get('content-length')
+            if content_length:
+                total_size = int(content_length)
+            
+            downloaded = 0
+            with open(temp_file.name, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+            
+            print(f"Download completed: {downloaded} bytes")
+            return temp_file.name, downloaded
+            
+        except Exception as e:
+            if 'temp_file' in locals() and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+            raise e
 
 # Global downloader instance
-downloader = SimpleYouTubeDownloader()
+downloader = YouTubeDownloader()
 
 @app.route('/')
 def home():
     return """
     <html>
         <head>
-            <title>YouTube Downloader API</title>
+            <title>YouTube Downloader API - VR Client</title>
             <style>
-                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+                body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
                 .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
                 code { background: #eee; padding: 2px 5px; border-radius: 3px; }
+                .format { margin: 5px 0; padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #007cba; }
+                .video-info { background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 10px 0; }
                 .success { color: green; }
                 .error { color: red; }
+                .btn { background: #007cba; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; display: inline-block; margin: 5px; }
             </style>
         </head>
         <body>
             <h1>YouTube Downloader API</h1>
-            <p>Simple API to download YouTube videos</p>
+            <p>Using Android VR Client (Oculus Quest 3) - Exact API Implementation</p>
+            
+            <div class="video-info">
+                <h3>Current Implementation:</h3>
+                <ul>
+                    <li><strong>Client:</strong> ANDROID_VR (Oculus Quest 3)</li>
+                    <li><strong>Version:</strong> 1.65.10</li>
+                    <li><strong>API:</strong> YouTube innerTube v1/player</li>
+                    <li><strong>Method:</strong> Exact request replication</li>
+                </ul>
+            </div>
             
             <div class="endpoint">
                 <h3>Download Endpoint</h3>
-                <p><code>GET /download?url=YOUTUBE_URL&format=QUALITY</code></p>
+                <p><code>GET /download?url=YOUTUBE_URL&quality=QUALITY</code></p>
                 <p><strong>Parameters:</strong></p>
                 <ul>
                     <li><code>url</code> - YouTube video URL (required)</li>
-                    <li><code>format</code> - Video quality (optional, default: best)</li>
+                    <li><code>quality</code> - Video quality (optional, default: best available)</li>
                 </ul>
                 <p><strong>Example:</strong></p>
-                <p><code>/download?url=https://www.youtube.com/watch?v=VIDEO_ID&format=720p</code></p>
+                <p><code>/download?url=https://www.youtube.com/watch?v=TxG1opTR0Yc&quality=720p</code></p>
             </div>
             
             <div class="endpoint">
                 <h3>Info Endpoint</h3>
                 <p><code>GET /info?url=YOUTUBE_URL</code></p>
                 <p>Get available formats for a video</p>
-            </div>
-            
-            <div class="endpoint">
-                <h3>Available Formats:</h3>
-                <p>144p, 240p, 360p, 480p, 720p, 1080p, best</p>
+                <p><strong>Example:</strong></p>
+                <p><code>/info?url=https://www.youtube.com/watch?v=TxG1opTR0Yc</code></p>
             </div>
             
             <div class="endpoint">
                 <h3>Test the API:</h3>
                 <form action="/info" method="get">
-                    <input type="text" name="url" placeholder="Enter YouTube URL" style="width: 300px; padding: 8px;">
-                    <button type="submit" style="padding: 8px 16px;">Get Info</button>
+                    <input type="text" name="url" placeholder="Enter YouTube URL" style="width: 400px; padding: 10px; font-size: 16px;" 
+                           value="https://www.youtube.com/watch?v=TxG1opTR0Yc">
+                    <button type="submit" style="padding: 10px 20px; font-size: 16px;">Get Video Info</button>
                 </form>
             </div>
         </body>
@@ -334,10 +354,10 @@ def home():
     """
 
 @app.route('/download')
-def download():
-    """Main download endpoint"""
+def download_video():
+    """Download YouTube video"""
     video_url = request.args.get('url', '')
-    quality = request.args.get('format', 'best')
+    quality = request.args.get('quality', 'best')
     
     if not video_url:
         return jsonify({"error": "URL parameter is required"}), 400
@@ -347,7 +367,8 @@ def download():
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
     try:
-        # Get video info first
+        # Get video info
+        print(f"Processing download request for: {video_url}")
         video_info = downloader.get_video_info(video_url)
         if 'error' in video_info:
             return jsonify({"error": video_info['error']}), 400
@@ -356,72 +377,51 @@ def download():
         if not formats:
             return jsonify({"error": "No downloadable formats found"}), 400
         
-        # Find selected format
-        selected_format = None
-        
-        if quality == 'best':
-            # Highest quality with both video and audio
-            for fmt in formats:
-                if fmt.get('hasVideo') and fmt.get('hasAudio') and fmt.get('url'):
-                    selected_format = fmt
-                    break
-            if not selected_format:
-                selected_format = formats[0] if formats else None
-        else:
-            # Specific quality
-            for fmt in formats:
-                if (fmt.get('quality') == quality and 
-                    fmt.get('hasVideo') and 
-                    fmt.get('hasAudio') and 
-                    fmt.get('url')):
-                    selected_format = fmt
-                    break
-        
+        # Find the best format based on quality preference
+        selected_format = _select_best_format(formats, quality)
         if not selected_format:
-            available_formats = list(set([f.get('quality', 'unknown') for f in formats if f.get('hasVideo')]))
+            available_formats = list(set([f.get('quality', 'unknown') for f in formats if f.get('hasVideo') and f.get('quality')]))
             return jsonify({
-                "error": f"Format {quality} not available",
-                "available_formats": available_formats
+                "error": f"Requested quality '{quality}' not available",
+                "available_formats": sorted(available_formats),
+                "all_formats": [f['quality'] for f in formats if f.get('hasVideo')]
             }), 400
         
         # Get download URL
-        download_url = selected_format.get('url', '')
+        download_url = selected_format.get('url')
         if not download_url:
-            return jsonify({"error": "No download URL available"}), 400
+            return jsonify({"error": "No download URL available for selected format"}), 400
         
-        # Sanitize filename
+        # Create filename
         title = video_info.get('title', 'video')
         safe_title = re.sub(r'[<>:"/\\|?*]', '', title)
         file_extension = 'mp4' if 'mp4' in selected_format.get('mimeType', '') else 'webm'
-        filename = f"{safe_title}_{quality}.{file_extension}"
+        filename = f"{safe_title}_{selected_format.get('quality', 'video')}.{file_extension}"
         
-        # Download to temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        print(f"Downloading: {title} at {selected_format.get('quality')} quality")
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Range': 'bytes=0-'
-        }
+        # Download video
+        temp_file_path, file_size = downloader.download_video(download_url, filename)
         
-        response = requests.get(download_url, headers=headers, stream=True, timeout=60)
-        response.raise_for_status()
-        
-        # Download file
-        total_size = 0
-        with open(temp_file.name, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    total_size += len(chunk)
-        
-        return send_file(
-            temp_file.name,
+        # Send file
+        response = send_file(
+            temp_file_path,
             as_attachment=True,
             download_name=filename,
-            mimetype='video/mp4'
+            mimetype=selected_format.get('mimeType', 'video/mp4')
         )
         
+        # Cleanup temp file after send
+        @response.call_on_close
+        def cleanup():
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+                print(f"Cleaned up temp file: {temp_file_path}")
+        
+        return response
+        
     except Exception as e:
+        print(f"Download error: {str(e)}")
         return jsonify({"error": f"Download failed: {str(e)}"}), 500
 
 @app.route('/info')
@@ -435,15 +435,50 @@ def video_info():
     if 'youtube.com' not in video_url and 'youtu.be' not in video_url:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
+    print(f"Getting info for: {video_url}")
     result = downloader.get_video_info(video_url)
     
-    # Return raw result for debugging
+    # Format the response for better readability
+    if 'formats' in result:
+        result['available_qualities'] = list(set(
+            [f['quality'] for f in result['formats'] if f.get('hasVideo') and f.get('quality')]
+        ))
+    
     return jsonify(result)
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint for Render"""
-    return jsonify({"status": "healthy", "service": "youtube-downloader"})
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy", 
+        "service": "youtube-downloader",
+        "version": "3.0",
+        "client": "ANDROID_VR",
+        "clientVersion": "1.65.10"
+    })
+
+def _select_best_format(formats, quality):
+    """Select the best format based on quality preference"""
+    video_formats = [f for f in formats if f.get('hasVideo')]
+    
+    if not video_formats:
+        return None
+    
+    if quality == 'best':
+        # Return highest quality with both audio and video
+        for fmt in video_formats:
+            if fmt.get('hasAudio') and fmt.get('hasVideo'):
+                return fmt
+        # If no combined format, return highest video quality
+        return max(video_formats, key=lambda x: x.get('height', 0))
+    else:
+        # Return specific quality
+        for fmt in video_formats:
+            if (fmt.get('quality') == quality and 
+                fmt.get('hasVideo') and 
+                (fmt.get('hasAudio') or quality in ['1080p', '720p', '480p'])):
+                return fmt
+        return None
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
