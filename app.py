@@ -5,16 +5,66 @@ import json
 import urllib.parse
 import os
 import tempfile
+import random
+import string
 from urllib.parse import parse_qs, unquote
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 class YouTubeDownloader:
     def __init__(self):
         self.session = requests.Session()
+        self.visitor_data = None
+        self._get_visitor_data()
+    
+    def _get_visitor_data(self):
+        """Get visitor data from YouTube homepage using exact VR user agent"""
+        try:
+            headers = {
+                'User-Agent': "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            }
+            
+            print("Fetching visitor data from YouTube...")
+            response = self.session.get('https://www.youtube.com/', headers=headers, timeout=10)
+            
+            # Extract visitor data from response using multiple patterns
+            visitor_patterns = [
+                r'"VISITOR_DATA"\s*:\s*"([^"]+)"',
+                r'VISITOR_DATA["\']?\s*:\s*["\']([^"\']+)["\']',
+                r'visitorData["\']?\s*:\s*["\']([^"\']+)["\']',
+                r'cvar\s*.*?VISITOR_DATA.*?:\s*["\']([^"\']+)["\']',
+            ]
+            
+            for pattern in visitor_patterns:
+                match = re.search(pattern, response.text)
+                if match:
+                    self.visitor_data = match.group(1)
+                    print(f"Found visitor data: {self.visitor_data[:50]}...")
+                    break
+            
+            if not self.visitor_data:
+                # Generate a fallback visitor data
+                self.visitor_data = self._generate_visitor_data()
+                print("Using generated visitor data")
+            
+        except Exception as e:
+            print(f"Error getting visitor data: {e}")
+            self.visitor_data = self._generate_visitor_data()
+    
+    def _generate_visitor_data(self):
+        """Generate a fallback visitor data"""
+        # Format: Cgt<random_12_chars>... (similar to real visitor data)
+        random_chars = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+        return f"Cgt{random_chars}="
     
     def get_video_info(self, video_url):
-        """YouTube video information extract using exact VR client"""
+        """YouTube video information extract using exact VR client with visitor data"""
         try:
             video_id = self._extract_video_id(video_url)
             if not video_id:
@@ -43,7 +93,7 @@ class YouTubeDownloader:
                 "racyCheckOk": True
             }
             
-            # Exact headers matching your request
+            # Exact headers matching your request with visitor data
             headers = {
                 'User-Agent': "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 'Connection': "Keep-Alive",
@@ -51,11 +101,13 @@ class YouTubeDownloader:
                 'Content-Type': "application/json",
                 'Origin': "https://www.youtube.com",
                 'X-Youtube-Client-Name': "28",
-                'X-Goog-Visitor-Id': "CgtBbW11S29OVGNvNCi9tKbIBjIKCgJCRBIEGgAgYg%3D%3D",
-                'X-Youtube-Client-Version': "1.65.10"
+                'X-Youtube-Client-Version': "1.65.10",
+                'X-Goog-Visitor-Id': self.visitor_data
             }
             
             print(f"Making API request for video ID: {video_id}")
+            print(f"Using visitor data: {self.visitor_data[:30]}...")
+            
             response = self.session.post(innertube_url, json=payload, headers=headers, timeout=30)
             
             if response.status_code != 200:
@@ -79,6 +131,11 @@ class YouTubeDownloader:
             
             if status != 'OK':
                 error_reason = playability_status.get('reason', 'Video not playable')
+                # Check if it's a bot detection error
+                if 'bot' in error_reason.lower() or 'sign in' in error_reason.lower():
+                    # Refresh visitor data and retry
+                    self._refresh_visitor_data()
+                    return {"error": f"Bot detection triggered. Please try again. Reason: {error_reason}"}
                 return {"error": f"Video not playable: {error_reason}"}
             
             # Extract video details
@@ -110,6 +167,11 @@ class YouTubeDownloader:
             
         except Exception as e:
             return {"error": f"Failed to parse response: {str(e)}"}
+    
+    def _refresh_visitor_data(self):
+        """Refresh visitor data"""
+        print("Refreshing visitor data...")
+        self._get_visitor_data()
     
     def _get_best_thumbnail(self, thumbnail_data):
         """Get the highest quality thumbnail"""
@@ -251,9 +313,9 @@ class YouTubeDownloader:
             # Create temporary file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             
-            # Download headers
+            # Download headers with same user agent
             headers = {
-                'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+                'User-Agent': "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 'Range': 'bytes=0-',
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity',
@@ -295,7 +357,7 @@ def home():
     return """
     <html>
         <head>
-            <title>YouTube Downloader API - VR Client</title>
+            <title>YouTube Downloader API - VR Client with Visitor Data</title>
             <style>
                 body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
                 .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
@@ -309,15 +371,16 @@ def home():
         </head>
         <body>
             <h1>YouTube Downloader API</h1>
-            <p>Using Android VR Client (Oculus Quest 3) - Exact API Implementation</p>
+            <p>Using Android VR Client with Real Visitor Data</p>
             
             <div class="video-info">
                 <h3>Current Implementation:</h3>
                 <ul>
                     <li><strong>Client:</strong> ANDROID_VR (Oculus Quest 3)</li>
                     <li><strong>Version:</strong> 1.65.10</li>
-                    <li><strong>API:</strong> YouTube innerTube v1/player</li>
-                    <li><strong>Method:</strong> Exact request replication</li>
+                    <li><strong>User Agent:</strong> Exact VR Oculus user agent</li>
+                    <li><strong>Visitor Data:</strong> Real data from YouTube</li>
+                    <li><strong>Anti-Bot:</strong> Visitor data integration</li>
                 </ul>
             </div>
             
@@ -446,15 +509,26 @@ def video_info():
     
     return jsonify(result)
 
+@app.route('/refresh-visitor')
+def refresh_visitor():
+    """Refresh visitor data manually"""
+    downloader._refresh_visitor_data()
+    return jsonify({
+        "status": "success", 
+        "message": "Visitor data refreshed",
+        "visitor_data": downloader.visitor_data[:50] + "..."
+    })
+
 @app.route('/health')
 def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy", 
         "service": "youtube-downloader",
-        "version": "3.0",
+        "version": "4.0",
         "client": "ANDROID_VR",
-        "clientVersion": "1.65.10"
+        "clientVersion": "1.65.10",
+        "visitor_data": downloader.visitor_data[:30] + "..." if downloader.visitor_data else "None"
     })
 
 def _select_best_format(formats, quality):
