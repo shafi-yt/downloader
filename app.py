@@ -8,7 +8,6 @@ import threading
 import time
 import json
 import urllib.parse
-import random
 
 # লগিং কনফিগারেশন
 logging.basicConfig(
@@ -18,9 +17,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# Worker endpoint from your provided link
-WORKER_ENDPOINT = "https://utubdbot.shafitest.workers.dev/"
 
 # Store download progress
 download_progress = {}
@@ -58,128 +54,254 @@ def extract_youtube_id(url):
             return match.group(1)
     return None
 
-def is_video_url(url):
-    """Check if the URL points to a video file"""
-    try:
-        # Check file extension first (faster)
-        video_extensions = ['.mp4', '.mpeg', '.ogg', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.3gp']
-        parsed_url = urllib.parse.urlparse(url)
-        path = parsed_url.path.lower()
-        
-        for ext in video_extensions:
-            if path.endswith(ext):
-                return True
-        
-        # If URL contains video keywords, assume it's video
-        video_keywords = ['videoplayback', 'video', 'mp4', 'stream']
-        if any(keyword in url.lower() for keyword in video_keywords):
-            return True
-            
-        return False
-        
-    except Exception as e:
-        logger.error(f"Error checking video URL: {e}")
-        return True
+def is_streaming_url(url):
+    """Check if URL is a streaming URL"""
+    streaming_indicators = [
+        'videoplayback',
+        'googlevideo.com',
+        'stream',
+        'm3u8',
+        'mpd',
+        'segment',
+        'chunk'
+    ]
+    
+    url_lower = url.lower()
+    return any(indicator in url_lower for indicator in streaming_indicators)
 
-def get_direct_video_url(url):
-    """Get direct video URL using the worker endpoint for any URL"""
+def get_streaming_headers():
+    """Get headers for streaming requests"""
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'identity',
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com',
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Range': 'bytes=0-',
+        'DNT': '1'
+    }
+
+def test_streaming_url(url):
+    """Test if streaming URL is accessible"""
     try:
-        # Use worker endpoint to get direct video URL
-        worker_url = f"{WORKER_ENDPOINT}?url={urllib.parse.quote(url)}"
-        logger.info(f"🔍 Getting direct URL via worker: {worker_url}")
+        headers = get_streaming_headers()
         
-        # Follow redirects to get final URL
-        response = session.head(worker_url, allow_redirects=True, timeout=30)
+        # Test with HEAD request first
+        response = session.head(url, headers=headers, timeout=30, allow_redirects=True)
         
-        if response.status_code == 200:
-            final_url = response.url
-            logger.info(f"✅ Worker returned URL: {final_url}")
+        if response.status_code in [200, 206]:
+            content_type = response.headers.get('content-type', '')
+            content_length = response.headers.get('content-length')
             
-            # Check if it's a video
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Range': 'bytes=0-999'
+            logger.info(f"✅ Streaming URL accessible - Status: {response.status_code}, Type: {content_type}, Size: {content_length}")
+            
+            return {
+                'success': True,
+                'url': url,
+                'content_type': content_type,
+                'content_length': content_length,
+                'headers': dict(response.headers)
             }
+        else:
+            # Try with GET request for partial content
+            headers['Range'] = 'bytes=0-999'
+            response = session.get(url, headers=headers, timeout=30, stream=True)
             
-            video_response = session.get(final_url, headers=headers, stream=True, timeout=30)
-            content_type = video_response.headers.get('content-type', '')
-            
-            if 'video' in content_type or any(ext in final_url for ext in ['.mp4', '.webm']):
+            if response.status_code in [200, 206]:
                 return {
                     'success': True,
-                    'download_url': final_url,
-                    'original_url': url,
-                    'type': 'direct',
-                    'content_type': content_type,
-                    'content_length': video_response.headers.get('content-length', 0)
+                    'url': url,
+                    'content_type': response.headers.get('content-type', ''),
+                    'content_length': response.headers.get('content-length'),
+                    'headers': dict(response.headers)
                 }
-        
-        return {'success': False, 'error': 'Could not get direct video URL'}
-        
+            else:
+                return {
+                    'success': False,
+                    'error': f'HTTP {response.status_code}',
+                    'details': 'Streaming server rejected the request'
+                }
+                
+    except requests.exceptions.Timeout:
+        return {
+            'success': False,
+            'error': 'Connection timeout',
+            'details': 'Streaming server is not responding'
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            'success': False,
+            'error': 'Connection failed',
+            'details': 'Cannot connect to streaming server'
+        }
     except Exception as e:
-        logger.error(f"Error getting direct URL: {e}")
-        return {'success': False, 'error': str(e)}
+        return {
+            'success': False,
+            'error': str(e),
+            'details': 'Unexpected error occurred'
+        }
+
+def download_streaming_video(stream_url, chat_id, message_id, token):
+    """Download streaming video with progress tracking"""
+    try:
+        logger.info(f"📥 Starting streaming download from: {stream_url}")
+        
+        download_progress[chat_id] = {'status': 'downloading', 'progress': 0}
+        send_progress_update(chat_id, message_id, token, 0, "Connecting to streaming server...")
+        
+        headers = get_streaming_headers()
+        
+        # Remove range header for full download
+        if 'Range' in headers:
+            del headers['Range']
+        
+        # Set longer timeout for streaming
+        timeout = 180  # 3 minutes
+        
+        logger.info(f"⏳ Starting streaming download (timeout: {timeout}s)")
+        
+        response = session.get(stream_url, headers=headers, stream=True, timeout=timeout)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        logger.info(f"📦 Streaming content size: {total_size} bytes")
+        
+        if total_size == 0:
+            # For streaming without known size, we'll download until completion
+            logger.info("⚠️ Unknown content size - streaming until completion")
+            total_size = 100  # Placeholder for progress calculation
+        
+        # Create temp file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        downloaded_size = 0
+        chunk_count = 0
+        start_time = time.time()
+        
+        send_progress_update(chat_id, message_id, token, 0, "Downloading streaming content...")
+        
+        for chunk in response.iter_content(chunk_size=8192 * 8):  # 64KB chunks for streaming
+            if chunk:
+                temp_file.write(chunk)
+                downloaded_size += len(chunk)
+                chunk_count += 1
+                
+                # Update progress
+                if total_size > 100:  # Only show progress if we know the size
+                    progress = min(99, (downloaded_size / total_size) * 100)
+                    current_progress = int(progress)
+                    
+                    # Update every 2MB or 5% progress
+                    if chunk_count % 50 == 0 or current_progress % 5 == 0:
+                        download_speed = downloaded_size / (time.time() - start_time) if (time.time() - start_time) > 0 else 0
+                        speed_text = f"({download_speed/1024/1024:.1f} MB/s)" if download_speed > 0 else ""
+                        
+                        download_progress[chat_id] = {
+                            'status': 'downloading', 
+                            'progress': current_progress,
+                            'downloaded_mb': downloaded_size / (1024*1024),
+                            'total_mb': total_size / (1024*1024) if total_size > 100 else 0
+                        }
+                        
+                        if total_size > 100:
+                            status_text = f"Streaming: {downloaded_size/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB {speed_text}"
+                        else:
+                            status_text = f"Streaming: {downloaded_size/(1024*1024):.1f}MB {speed_text}"
+                        
+                        send_progress_update(chat_id, message_id, token, current_progress, status_text)
+        
+        temp_file.close()
+        
+        # Verify download
+        file_size = os.path.getsize(temp_file.name)
+        logger.info(f"💾 Streaming download completed: {file_size} bytes")
+        
+        if file_size == 0:
+            raise Exception("Streaming download resulted in empty file")
+        
+        download_progress[chat_id] = {'status': 'completed', 'progress': 100}
+        return temp_file.name
+        
+    except requests.exceptions.Timeout:
+        error_msg = "Streaming download timeout - Server took too long"
+        logger.error(f"❌ {error_msg}")
+        download_progress[chat_id] = {'status': 'error', 'error': error_msg}
+        send_progress_update(chat_id, message_id, token, 0, f"❌ {error_msg}")
+        return None
+    except requests.exceptions.ChunkedEncodingError:
+        error_msg = "Streaming connection interrupted"
+        logger.error(f"❌ {error_msg}")
+        download_progress[chat_id] = {'status': 'error', 'error': error_msg}
+        send_progress_update(chat_id, message_id, token, 0, f"❌ {error_msg}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Streaming download error: {e}")
+        download_progress[chat_id] = {'status': 'error', 'error': str(e)}
+        send_progress_update(chat_id, message_id, token, 0, f"❌ Streaming Error")
+        return None
+
+def handle_streaming_url(url):
+    """Handle streaming URL processing"""
+    try:
+        logger.info(f"🎬 Processing streaming URL: {url}")
+        
+        # Test the streaming URL
+        test_result = test_streaming_url(url)
+        
+        if test_result['success']:
+            return {
+                'success': True,
+                'download_url': url,
+                'original_url': url,
+                'type': 'streaming',
+                'content_type': test_result['content_type'],
+                'content_length': test_result['content_length'],
+                'is_streaming': True
+            }
+        else:
+            # Try alternative approach - direct download without testing
+            logger.info("🔄 Trying direct streaming approach...")
+            return {
+                'success': True,
+                'download_url': url,
+                'original_url': url,
+                'type': 'streaming',
+                'content_type': 'video/mp4',
+                'content_length': 0,
+                'is_streaming': True,
+                'direct_stream': True
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Streaming URL handling error: {e}")
+        return {
+            'success': False,
+            'error': f"Streaming processing failed: {str(e)}",
+            'details': 'Cannot process this streaming URL'
+        }
 
 def get_video_info(url):
     """Get video information from URL"""
     try:
-        # If it's a YouTube URL, use the worker endpoint
-        youtube_id = extract_youtube_id(url)
-        if youtube_id:
-            worker_url = f"{WORKER_ENDPOINT}?url=https://youtu.be/{youtube_id}"
-            logger.info(f"🔍 Checking YouTube video: {worker_url}")
-            
-            response = session.head(worker_url, allow_redirects=True, timeout=30)
-            
-            logger.info(f"📡 YouTube Response Status: {response.status_code}")
+        # Check if it's a streaming URL
+        if is_streaming_url(url):
+            return handle_streaming_url(url)
+        
+        # For regular URLs, try direct access
+        headers = get_streaming_headers()
+        
+        try:
+            response = session.head(url, headers=headers, timeout=30, allow_redirects=True)
             
             if response.status_code == 200:
+                content_type = response.headers.get('content-type', '')
                 content_length = response.headers.get('content-length', 0)
-                content_type = response.headers.get('content-type', 'unknown')
                 
-                logger.info(f"✅ YouTube video available - Size: {content_length}, Type: {content_type}")
-                
-                return {
-                    'success': True,
-                    'download_url': worker_url,
-                    'original_url': url,
-                    'type': 'youtube',
-                    'content_type': content_type,
-                    'content_length': content_length,
-                    'video_id': youtube_id
-                }
-            else:
-                error_msg = f"YouTube video not available - Status: {response.status_code}"
-                logger.error(f"❌ {error_msg}")
-                return {'success': False, 'error': error_msg}
-        
-        # For Google Video URLs, use worker to get direct link
-        elif 'googlevideo.com' in url:
-            logger.info(f"🔄 Processing Google Video URL via worker...")
-            return get_direct_video_url(url)
-        
-        # For other direct video URLs
-        else:
-            logger.info(f"🔍 Checking direct video URL: {url}")
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Range': 'bytes=0-1999',
-                'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
-                'Referer': 'https://www.youtube.com/'
-            }
-            
-            try:
-                response = session.get(url, headers=headers, timeout=45, stream=True)
-                
-                logger.info(f"📡 Direct URL Response Status: {response.status_code}")
-                
-                if response.status_code in [200, 206]:
-                    content_type = response.headers.get('content-type', 'unknown')
-                    content_length = response.headers.get('content-length', 0)
-                    
-                    logger.info(f"✅ Direct video accessible - Size: {content_length}, Type: {content_type}")
-                    
+                if 'video' in content_type:
                     return {
                         'success': True,
                         'download_url': url,
@@ -188,143 +310,17 @@ def get_video_info(url):
                         'content_type': content_type,
                         'content_length': content_length
                     }
-                else:
-                    # Try using worker as fallback
-                    logger.info("🔄 Trying worker as fallback...")
-                    return get_direct_video_url(url)
                     
-            except requests.exceptions.Timeout:
-                logger.warning("⚠️ Direct check timeout, trying worker...")
-                return get_direct_video_url(url)
-            except Exception as e:
-                logger.warning(f"⚠️ Direct check failed: {e}, trying worker...")
-                return get_direct_video_url(url)
+        except Exception as e:
+            logger.warning(f"⚠️ Direct check failed: {e}")
+        
+        # If all else fails, treat as streaming
+        return handle_streaming_url(url)
             
     except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
+        error_msg = f"URL processing error: {str(e)}"
         logger.error(f"❌ {error_msg}")
         return {'success': False, 'error': error_msg}
-
-def download_video_with_progress(download_url, chat_id, message_id, token, video_info):
-    """Download video with progress tracking"""
-    try:
-        logger.info(f"📥 Starting download from: {download_url}")
-        
-        download_progress[chat_id] = {'status': 'downloading', 'progress': 0}
-        send_progress_update(chat_id, message_id, token, 0, "Connecting to video server...")
-        
-        # Enhanced headers for video download
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'video/mp4,video/webm,video/ogg,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'identity',
-            'Connection': 'keep-alive',
-            'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com',
-            'Sec-Fetch-Dest': 'video',
-            'Sec-Fetch-Mode': 'no-cors',
-            'Sec-Fetch-Site': 'cross-site',
-            'DNT': '1',
-            'Upgrade-Insecure-Requests': '1'
-        }
-        
-        # Use session for persistent connection
-        timeout = 120
-        logger.info(f"⏳ Setting download timeout: {timeout} seconds")
-        
-        response = session.get(download_url, headers=headers, stream=True, timeout=timeout)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        logger.info(f"📦 Total size: {total_size} bytes")
-        
-        if total_size == 0:
-            raise Exception("Content length is 0 - possibly blocked")
-        
-        # Determine file extension
-        content_type = response.headers.get('content-type', '')
-        file_extension = '.mp4'
-        
-        if 'video/mp4' in content_type:
-            file_extension = '.mp4'
-        elif 'video/webm' in content_type:
-            file_extension = '.webm'
-        elif 'video/ogg' in content_type:
-            file_extension = '.ogg'
-        
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
-        downloaded_size = 0
-        last_progress_update = 0
-        chunk_count = 0
-        
-        send_progress_update(chat_id, message_id, token, 0, "Downloading video...")
-        
-        start_time = time.time()
-        
-        for chunk in response.iter_content(chunk_size=8192 * 4):  # 32KB chunks
-            if chunk:
-                temp_file.write(chunk)
-                downloaded_size += len(chunk)
-                chunk_count += 1
-                
-                # Update progress every 2 seconds or 5% progress
-                current_time = time.time()
-                if total_size > 0:
-                    progress = (downloaded_size / total_size) * 100
-                    current_progress = int(progress)
-                    
-                    if (current_progress >= last_progress_update + 5 or 
-                        current_time - start_time >= 2 or 
-                        current_progress == 100):
-                        
-                        download_speed = downloaded_size / (current_time - start_time) if current_time > start_time else 0
-                        speed_text = f"({download_speed/1024/1024:.1f} MB/s)" if download_speed > 0 else ""
-                        
-                        download_progress[chat_id] = {
-                            'status': 'downloading', 
-                            'progress': current_progress,
-                            'downloaded_mb': downloaded_size / (1024*1024),
-                            'total_mb': total_size / (1024*1024)
-                        }
-                        
-                        send_progress_update(chat_id, message_id, token, current_progress, 
-                                           f"Downloading: {downloaded_size/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB {speed_text}")
-                        last_progress_update = current_progress
-                        start_time = current_time
-        
-        temp_file.close()
-        
-        # Verify download
-        file_size = os.path.getsize(temp_file.name)
-        logger.info(f"💾 File downloaded: {file_size} bytes")
-        
-        if file_size == 0:
-            raise Exception("Downloaded file is empty")
-        
-        if total_size > 0 and abs(file_size - total_size) > 10000:  # Allow 10KB difference
-            logger.warning(f"⚠️ File size mismatch: expected {total_size}, got {file_size}")
-        
-        download_progress[chat_id] = {'status': 'completed', 'progress': 100}
-        return temp_file.name
-        
-    except requests.exceptions.Timeout:
-        error_msg = "Download timeout - Server took too long to respond"
-        logger.error(f"❌ {error_msg}")
-        download_progress[chat_id] = {'status': 'error', 'error': error_msg}
-        send_progress_update(chat_id, message_id, token, 0, f"❌ {error_msg}")
-        return None
-    except requests.exceptions.HTTPError as e:
-        error_msg = f"HTTP Error {e.response.status_code if e.response else 'Unknown'}"
-        logger.error(f"❌ {error_msg}")
-        download_progress[chat_id] = {'status': 'error', 'error': error_msg}
-        send_progress_update(chat_id, message_id, token, 0, f"❌ {error_msg}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Download error: {e}")
-        download_progress[chat_id] = {'status': 'error', 'error': str(e)}
-        send_progress_update(chat_id, message_id, token, 0, f"❌ Download Error")
-        return None
 
 def send_progress_update(chat_id, message_id, token, progress, status):
     """Send progress update to Telegram"""
@@ -365,7 +361,7 @@ def send_video_to_telegram(chat_id, video_path, original_url, token):
         file_size = os.path.getsize(video_path)
         logger.info(f"📤 Uploading video: {file_size} bytes")
         
-        timeout = 300  # 5 minutes for large files
+        timeout = 300
         
         with open(video_path, 'rb') as video_file:
             files = {'video': video_file}
@@ -383,12 +379,10 @@ def send_video_to_telegram(chat_id, video_path, original_url, token):
             return True
         else:
             logger.error(f"❌ Video upload failed: {response.text}")
-            # Try sending as document if video fails
             return send_as_document(chat_id, video_path, original_url, token)
             
     except Exception as e:
         logger.error(f"❌ Video upload error: {e}")
-        # Try sending as document as fallback
         return send_as_document(chat_id, video_path, original_url, token)
 
 def send_as_document(chat_id, file_path, original_url, token):
@@ -400,7 +394,7 @@ def send_as_document(chat_id, file_path, original_url, token):
             files = {'document': file}
             data = {
                 'chat_id': chat_id,
-                'caption': f"📁 Video File (Sent as Document)\n\n🔗 Source: {original_url[:100]}...",
+                'caption': f"📁 Video File\n\n🔗 Source: {original_url[:100]}...",
                 'parse_mode': 'HTML'
             }
             response = session.post(url, files=files, data=data, timeout=300)
@@ -408,47 +402,55 @@ def send_as_document(chat_id, file_path, original_url, token):
         return response.status_code == 200
         
     except Exception as e:
-        logger.error(f"❌ Document upload also failed: {e}")
+        logger.error(f"❌ Document upload failed: {e}")
         return False
 
 def start_download_thread(chat_id, video_url, message_id, token):
     """Start download in separate thread"""
     def download_job():
         try:
-            logger.info(f"🎬 Processing video URL: {video_url}")
+            logger.info(f"🎬 Processing URL: {video_url}")
             
-            send_telegram_message_direct(chat_id, token, "🔍 Analyzing video URL...")
+            send_telegram_message_direct(chat_id, token, "🔍 Analyzing URL...")
             
             # Get video info
             video_info = get_video_info(video_url)
             
             if not video_info['success']:
                 error_details = f"""
-❌ <b>Could not process video URL</b>
+❌ <b>Could not process URL</b>
 
-🔍 <b>Error Details:</b>
+🔍 <b>Details:</b>
 • <b>URL:</b> <code>{video_url[:100]}...</code>
 • <b>Error:</b> {video_info['error']}
 
-📝 <b>Possible Solutions:</b>
-• Check if the video is available
-• Try a different URL
-• The video might be restricted
+📝 <b>Trying alternative method...</b>
                 """
                 send_telegram_message_direct(chat_id, token, error_details)
-                return
+                
+                # Try direct streaming as fallback
+                video_info = {
+                    'success': True,
+                    'download_url': video_url,
+                    'original_url': video_url,
+                    'type': 'streaming',
+                    'content_type': 'video/mp4',
+                    'content_length': 0,
+                    'is_streaming': True,
+                    'direct_stream': True
+                }
             
             # Send video info
-            video_type = "YouTube" if video_info['type'] == 'youtube' else "Direct Video"
-            file_size_mb = int(video_info.get('content_length', 0)) / (1024*1024) if video_info.get('content_length', 0) else 0
+            video_type = "Streaming" if video_info.get('is_streaming') else "Direct"
+            file_size_mb = int(video_info.get('content_length', 0)) / (1024*1024) if video_info.get('content_length', 0) else "Unknown"
             
             info_text = f"""
-✅ <b>Video Found!</b>
+✅ <b>URL Accepted</b>
 
-📹 <b>Video Information:</b>
+📹 <b>Information:</b>
 • <b>Type:</b> {video_type}
 • <b>Content Type:</b> {video_info.get('content_type', 'Unknown')}
-• <b>File Size:</b> {file_size_mb:.2f} MB
+• <b>File Size:</b> {file_size_mb if file_size_mb != 'Unknown' else 'Unknown'} MB
 
 ⏳ <b>Starting download...</b>
             """
@@ -456,17 +458,16 @@ def start_download_thread(chat_id, video_url, message_id, token):
             send_telegram_message_direct(chat_id, token, info_text)
             
             # Download video
-            video_path = download_video_with_progress(
+            video_path = download_streaming_video(
                 video_info['download_url'], 
                 chat_id, 
                 message_id,
-                token,
-                video_info
+                token
             )
             
             if not video_path:
                 send_telegram_message_direct(chat_id, token, 
-                    "❌ Download failed. This could be due to:\n• Video restrictions\n• Network issues\n• Server timeout\n\nPlease try again or use a different URL.")
+                    "❌ Download failed. Possible reasons:\n• URL expired\n• Server restrictions\n• Network issues\n\nPlease try a fresh URL.")
                 return
             
             # Upload to Telegram
@@ -491,19 +492,19 @@ def start_download_thread(chat_id, video_url, message_id, token):
             if upload_success:
                 send_telegram_message_direct(chat_id, token, "✅ <b>Video successfully sent!</b>")
             else:
-                send_telegram_message_direct(chat_id, token, "❌ <b>Upload failed. Video might be too large.</b>")
+                send_telegram_message_direct(chat_id, token, "❌ <b>Upload failed. File might be too large or corrupted.</b>")
                 
         except Exception as e:
             logger.error(f"❌ Download thread error: {e}")
             error_text = f"""
-❌ <b>Download Failed</b>
+❌ <b>Processing Failed</b>
 
 🔍 <b>Error:</b> {str(e)}
 
 📝 <b>Please try:</b>
-• Another video URL
-• Shorter video
-• Different format
+• Fresh URL
+• Different video
+• Shorter content
             """
             send_telegram_message_direct(chat_id, token, error_text)
         finally:
@@ -513,8 +514,6 @@ def start_download_thread(chat_id, video_url, message_id, token):
     thread = threading.Thread(target=download_job)
     thread.daemon = True
     thread.start()
-
-# ... (Flask routes remain the same as previous version)
 
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
@@ -529,10 +528,9 @@ def handle_request():
 
         if request.method == 'GET':
             return jsonify({
-                'status': 'Universal Video Downloader Bot is running',
-                'endpoint': WORKER_ENDPOINT,
-                'token_received': True,
-                'message': 'Use POST method for Telegram webhook'
+                'status': 'Streaming Video Downloader Bot is running',
+                'features': 'Supports streaming URLs, direct videos, and Google Video links',
+                'token_received': True
             })
 
         if request.method == 'POST':
@@ -540,8 +538,6 @@ def handle_request():
             
             if not update:
                 return jsonify({'error': 'Invalid JSON data'}), 400
-            
-            logger.info(f"📩 Update received")
             
             chat_id = None
             message_text = ''
@@ -559,28 +555,28 @@ def handle_request():
 
             if message_text.startswith('/start'):
                 welcome_text = """
-🎬 <b>Universal Video Downloader Bot</b>
+🎬 <b>Streaming Video Downloader Bot</b>
 
-I can download videos from various sources and send them to you!
+I can download videos from streaming URLs and direct links!
 
 📌 <b>How to use:</b>
-Just send me any video URL or use /download command
+Just send me any video URL
 
-🔗 <b>Supported Sources:</b>
-• YouTube videos
-• Direct video links
+🔗 <b>Supported:</b>
 • Google Video links
-• Streaming videos
+• Streaming URLs
+• Direct video links
+• YouTube URLs
 
 ⚡ <b>Commands:</b>
 /start - Show this help
-/download [URL] - Download video from URL
+/download [URL] - Download from URL
 
 📝 <b>Examples:</b>
-<code>https://youtu.be/FbcHYg4Qx7o</code>
+<code>https://googlevideo.com/videoplayback?...</code>
 <code>/download https://example.com/video.mp4</code>
 
-⚠️ <b>Note:</b> Some videos might have restrictions.
+⚠️ <b>Note:</b> Some URLs may expire quickly.
                 """
                 
                 return jsonify(send_telegram_message(chat_id, welcome_text))
@@ -590,22 +586,19 @@ Just send me any video URL or use /download command
                 if len(parts) < 2:
                     return jsonify(send_telegram_message(
                         chat_id,
-                        "❌ <b>Usage:</b> <code>/download URL</code>\n\nExample: <code>/download https://example.com/video.mp4</code>"
+                        "❌ <b>Usage:</b> <code>/download URL</code>"
                     ))
                 
                 video_url = parts[1].strip()
                 return process_video_download(chat_id, video_url, token)
 
-            elif (extract_youtube_id(message_text) or 
-                  'video' in message_text.lower() or 
-                  any(ext in message_text.lower() for ext in ['.mp4', '.webm', '.avi', '.mov']) or 
-                  'googlevideo.com' in message_text):
+            elif message_text.strip().startswith('http'):
                 return process_video_download(chat_id, message_text, token)
 
             else:
                 return jsonify(send_telegram_message(
                     chat_id,
-                    "❌ Please send a valid video URL or use /download command.\n\nUse /start to see supported formats."
+                    "❌ Please send a valid URL starting with http:// or https://"
                 ))
 
     except Exception as e:
@@ -617,7 +610,7 @@ def process_video_download(chat_id, video_url, token):
     try:
         processing_msg = send_telegram_message(
             chat_id,
-            f"🔍 Processing video URL...\n\n<code>{video_url[:100]}...</code>"
+            f"🔍 Processing URL...\n\n<code>{video_url[:100]}...</code>"
         )
         
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -630,56 +623,22 @@ def process_video_download(chat_id, video_url, token):
         else:
             return jsonify(send_telegram_message(
                 chat_id,
-                "❌ Failed to start download process. Please try again."
+                "❌ Failed to start download process."
             ))
     except Exception as e:
-        logger.error(f"Error processing video download: {e}")
+        logger.error(f"Error processing download: {e}")
         return jsonify(send_telegram_message(
             chat_id,
             f"❌ Error: {str(e)}"
         ))
 
-@app.route('/debug', methods=['GET'])
-def debug_endpoint():
-    url = request.args.get('url')
-    
-    if not url:
-        return jsonify({'error': 'URL parameter required'})
-    
-    video_info = get_video_info(url)
-    
-    return jsonify({
-        'input_url': url,
-        'is_youtube': bool(extract_youtube_id(url)),
-        'video_info': video_info
-    })
-
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'service': 'Universal Video Downloader Bot',
+        'service': 'Streaming Video Downloader',
         'timestamp': time.time()
     })
-
-@app.route('/webhook', methods=['POST'])
-def set_webhook():
-    try:
-        token = request.args.get('token')
-        webhook_url = request.args.get('url')
-        
-        if not token or not webhook_url:
-            return jsonify({'error': 'Token and URL required'}), 400
-        
-        set_webhook_url = f"https://api.telegram.org/bot{token}/setWebhook"
-        data = {'url': f"{webhook_url}?token={token}"}
-        response = session.post(set_webhook_url, data=data, timeout=10)
-        
-        return jsonify(response.json())
-        
-    except Exception as e:
-        logger.error(f'Webhook error: {e}')
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
