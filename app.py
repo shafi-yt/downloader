@@ -8,6 +8,7 @@ import threading
 import time
 import json
 import mimetypes
+import urllib.parse
 
 # লগিং কনফিগারেশন
 logging.basicConfig(
@@ -57,30 +58,37 @@ def extract_youtube_id(url):
 def is_video_url(url):
     """Check if the URL points to a video file"""
     try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
-        content_type = response.headers.get('content-type', '').lower()
-        
-        video_types = ['video/mp4', 'video/mpeg', 'video/ogg', 'video/webm', 'video/avi', 'video/quicktime']
-        
-        # Check if content-type indicates video
-        for video_type in video_types:
-            if video_type in content_type:
-                return True
-        
-        # Check file extension
-        video_extensions = ['.mp4', '.mpeg', '.ogg', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv']
-        parsed_url = requests.utils.urlparse(url)
+        # Check file extension first (faster)
+        video_extensions = ['.mp4', '.mpeg', '.ogg', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.3gp']
+        parsed_url = urllib.parse.urlparse(url)
         path = parsed_url.path.lower()
         
         for ext in video_extensions:
             if path.endswith(ext):
+                return True
+        
+        # If no clear extension, check content-type
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Range': 'bytes=0-1'  # Just get first bytes to check type
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10, stream=True)
+        content_type = response.headers.get('content-type', '').lower()
+        
+        video_types = ['video/mp4', 'video/mpeg', 'video/ogg', 'video/webm', 'video/avi', 'video/quicktime', 'video/x-msvideo']
+        
+        # Check if content-type indicates video
+        for video_type in video_types:
+            if video_type in content_type:
                 return True
                 
         return False
         
     except Exception as e:
         logger.error(f"Error checking video URL: {e}")
-        return False
+        # If we can't check, assume it might be a video and let download attempt happen
+        return True
 
 def get_video_info(url):
     """Get video information from URL"""
@@ -115,37 +123,40 @@ def get_video_info(url):
                 logger.error(f"❌ {error_msg}")
                 return {'success': False, 'error': error_msg}
         
-        # For direct video URLs
+        # For direct video URLs - USE GET instead of HEAD to avoid 403 issues
         else:
             logger.info(f"🔍 Checking direct video URL: {url}")
             
-            response = requests.head(url, allow_redirects=True, timeout=30)
+            # Use GET request with range header to avoid downloading entire file
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Range': 'bytes=0-999'  # Get first 1000 bytes to check
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30, stream=True)
             
             logger.info(f"📡 Direct URL Response Status: {response.status_code}")
             logger.info(f"📡 Content-Type: {response.headers.get('content-type', 'unknown')}")
             
-            if response.status_code == 200:
+            if response.status_code in [200, 206]:  # 206 is Partial Content
                 content_type = response.headers.get('content-type', 'unknown')
                 content_length = response.headers.get('content-length', 0)
                 
-                # Check if it's a video
-                if is_video_url(url):
-                    logger.info(f"✅ Direct video available - Size: {content_length}, Type: {content_type}")
-                    
-                    return {
-                        'success': True,
-                        'download_url': url,
-                        'original_url': url,
-                        'type': 'direct',
-                        'content_type': content_type,
-                        'content_length': content_length
-                    }
-                else:
-                    error_msg = f"URL does not point to a video file - Content-Type: {content_type}"
-                    logger.error(f"❌ {error_msg}")
-                    return {'success': False, 'error': error_msg}
+                # For direct URLs, we'll try to download anyway even if content-type check fails
+                # Some servers don't provide proper content-type headers
+                logger.info(f"✅ Direct video accessible - Size: {content_length}, Type: {content_type}")
+                
+                return {
+                    'success': True,
+                    'download_url': url,
+                    'original_url': url,
+                    'type': 'direct',
+                    'content_type': content_type,
+                    'content_length': content_length,
+                    'requires_streaming': True
+                }
             else:
-                error_msg = f"Direct video not available - Status: {response.status_code}"
+                error_msg = f"Direct video not accessible - Status: {response.status_code}"
                 logger.error(f"❌ {error_msg}")
                 return {'success': False, 'error': error_msg}
             
@@ -162,7 +173,7 @@ def get_video_info(url):
         logger.error(f"❌ {error_msg}")
         return {'success': False, 'error': error_msg}
 
-def download_video_with_progress(download_url, chat_id, message_id, token):
+def download_video_with_progress(download_url, chat_id, message_id, token, is_direct_url=False):
     """Download video with progress tracking"""
     try:
         logger.info(f"📥 Starting download from: {download_url}")
@@ -173,14 +184,33 @@ def download_video_with_progress(download_url, chat_id, message_id, token):
         # Send initial progress
         send_progress_update(chat_id, message_id, token, 0, "Starting download...")
         
+        # Set headers for the download
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'video/mp4,video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'identity',
+            'Connection': 'keep-alive',
+        }
+        
+        # For direct URLs, add referer and other headers to avoid restrictions
+        if is_direct_url:
+            headers.update({
+                'Referer': 'https://www.google.com/',
+                'Origin': 'https://www.google.com',
+                'Sec-Fetch-Dest': 'video',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'cross-site',
+            })
+        
         # Download the video with GET request
-        response = requests.get(download_url, stream=True, timeout=60)
+        response = requests.get(download_url, headers=headers, stream=True, timeout=60)
         response.raise_for_status()
         
         total_size = int(response.headers.get('content-length', 0))
         logger.info(f"📦 Total size: {total_size} bytes")
         
-        # Determine file extension
+        # Determine file extension from content-type or URL
         content_type = response.headers.get('content-type', '')
         file_extension = '.mp4'  # default
         
@@ -194,6 +224,14 @@ def download_video_with_progress(download_url, chat_id, message_id, token):
             file_extension = '.avi'
         elif 'video/quicktime' in content_type:
             file_extension = '.mov'
+        else:
+            # Try to get extension from URL
+            parsed_url = urllib.parse.urlparse(download_url)
+            path = parsed_url.path.lower()
+            for ext in ['.mp4', '.webm', '.ogg', '.avi', '.mov', '.mkv']:
+                if path.endswith(ext):
+                    file_extension = ext
+                    break
         
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
         downloaded_size = 0
@@ -279,7 +317,7 @@ def send_video_to_telegram(chat_id, video_path, original_url, token):
             files = {'video': video_file}
             data = {
                 'chat_id': chat_id,
-                'caption': f"🎥 Downloaded Video\n\n🔗 Original: {original_url}",
+                'caption': f"🎥 Downloaded Video\n\n🔗 Source: {original_url[:100]}...",
                 'parse_mode': 'HTML'
             }
             response = requests.post(url, files=files, data=data, timeout=120)
@@ -306,11 +344,24 @@ def start_download_thread(chat_id, video_url, message_id, token):
             video_info = get_video_info(video_url)
             
             if not video_info['success']:
-                error_details = f"""
+                # Even if get_video_info fails, try direct download for certain URLs
+                if 'googlevideo.com' in video_url or 'video' in video_url.lower():
+                    logger.info("🔄 Trying direct download despite initial check failure...")
+                    video_info = {
+                        'success': True,
+                        'download_url': video_url,
+                        'original_url': video_url,
+                        'type': 'direct',
+                        'content_type': 'video/mp4',
+                        'content_length': 0,
+                        'requires_streaming': True
+                    }
+                else:
+                    error_details = f"""
 ❌ <b>Could not fetch video information</b>
 
 🔍 <b>Error Details:</b>
-• <b>URL:</b> <code>{video_url}</code>
+• <b>URL:</b> <code>{video_url[:100]}...</code>
 • <b>Error:</b> {video_info['error']}
 • <b>Type:</b> {'YouTube' if extract_youtube_id(video_url) else 'Direct Video'}
 
@@ -319,32 +370,34 @@ def start_download_thread(chat_id, video_url, message_id, token):
 • Try a different URL
 • The video might be restricted or private
 • Make sure the URL points directly to a video file
-                """
-                send_telegram_message_direct(chat_id, token, error_details)
-                return
+                    """
+                    send_telegram_message_direct(chat_id, token, error_details)
+                    return
             
             # Send video info to user
             video_type = "YouTube" if video_info['type'] == 'youtube' else "Direct Video"
-            file_size_mb = int(video_info.get('content_length', 0)) / (1024*1024)
+            file_size_mb = int(video_info.get('content_length', 0)) / (1024*1024) if video_info.get('content_length', 0) else 0
             
             info_text = f"""
 ✅ <b>Video Found!</b>
 
 📹 <b>Video Information:</b>
 • <b>Type:</b> {video_type}
-• <b>Content Type:</b> {video_info['content_type']}
-• <b>File Size:</b> {file_size_mb:.2f} MB
+• <b>Content Type:</b> {video_info.get('content_type', 'Unknown')}
+• <b>File Size:</b> {file_size_mb:.2f} MB if available
 
 ⏳ <b>Starting download...</b>
             """
             send_telegram_message_direct(chat_id, token, info_text)
             
             # Download video
+            is_direct_url = video_info['type'] == 'direct'
             video_path = download_video_with_progress(
                 video_info['download_url'], 
                 chat_id, 
                 message_id,
-                token
+                token,
+                is_direct_url=is_direct_url
             )
             
             if not video_path:
@@ -384,7 +437,7 @@ def start_download_thread(chat_id, video_url, message_id, token):
 🔍 <b>Error Details:</b>
 • <b>Error Type:</b> {type(e).__name__}
 • <b>Error Message:</b> {str(e)}
-• <b>URL:</b> <code>{video_url}</code>
+• <b>URL:</b> <code>{video_url[:100]}...</code>
 
 📝 <b>Please try again later or contact support.</b>
             """
@@ -397,6 +450,9 @@ def start_download_thread(chat_id, video_url, message_id, token):
     thread = threading.Thread(target=download_job)
     thread.daemon = True
     thread.start()
+
+# ... (rest of the Flask app routes remain the same as previous version)
+# The routes from the previous code should be kept as they are
 
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
@@ -425,8 +481,6 @@ def handle_request():
             
             if not update:
                 return jsonify({'error': 'Invalid JSON data'}), 400
-            
-            logger.info(f"📩 Update received: {json.dumps(update, indent=2)}")
             
             # মেসেজ ডেটা এক্সট্র্যাক্ট
             chat_id = None
@@ -458,6 +512,7 @@ I can download videos from various sources and send them to you!
 🔗 <b>Supported Sources:</b>
 • YouTube (all formats)
 • Direct video links (.mp4, .webm, etc.)
+• Google Video links
 • Any URL that points to a video file
 
 ⚡ <b>Commands:</b>
@@ -467,6 +522,7 @@ I can download videos from various sources and send them to you!
 📝 <b>Examples:</b>
 <code>https://youtu.be/FbcHYg4Qx7o</code>
 <code>/download https://example.com/video.mp4</code>
+<code>/download https://googlevideo.com/...long_url...</code>
 
 ⚠️ <b>Note:</b> Some videos might not be available due to restrictions.
                 """
@@ -489,7 +545,7 @@ I can download videos from various sources and send them to you!
                 return process_video_download(chat_id, video_url, token)
 
             # Direct URL processing (without /download command)
-            elif extract_youtube_id(message_text) or is_video_url(message_text):
+            elif extract_youtube_id(message_text) or 'video' in message_text.lower() or any(ext in message_text.lower() for ext in ['.mp4', '.webm', '.avi', '.mov']):
                 return process_video_download(chat_id, message_text, token)
 
             # Unknown message
@@ -509,7 +565,7 @@ def process_video_download(chat_id, video_url, token):
         # Send initial processing message
         processing_msg = send_telegram_message(
             chat_id=chat_id,
-            text=f"🔍 Processing video URL...\n\n<code>{video_url}</code>"
+            text=f"🔍 Processing video URL...\n\n<code>{video_url[:100]}...</code>"
         )
         
         # Send the processing message and get its message ID
