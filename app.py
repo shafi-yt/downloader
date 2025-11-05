@@ -66,22 +66,11 @@ def is_video_url(url):
             if path.endswith(ext):
                 return True
         
-        # If no clear extension, check content-type
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Range': 'bytes=0-1'  # Just get first bytes to check type
-        }
-        
-        response = requests.get(url, headers=headers, timeout=10, stream=True)
-        content_type = response.headers.get('content-type', '').lower()
-        
-        video_types = ['video/mp4', 'video/mpeg', 'video/ogg', 'video/webm', 'video/avi', 'video/quicktime', 'video/x-msvideo']
-        
-        # Check if content-type indicates video
-        for video_type in video_types:
-            if video_type in content_type:
-                return True
-                
+        # If URL contains video keywords, assume it's video
+        video_keywords = ['videoplayback', 'video', 'mp4', 'stream']
+        if any(keyword in url.lower() for keyword in video_keywords):
+            return True
+            
         return False
         
     except Exception as e:
@@ -122,47 +111,63 @@ def get_video_info(url):
                 logger.error(f"❌ {error_msg}")
                 return {'success': False, 'error': error_msg}
         
-        # For direct video URLs - USE GET instead of HEAD to avoid 403 issues
+        # For direct video URLs - Handle streaming URLs with longer timeouts
         else:
             logger.info(f"🔍 Checking direct video URL: {url}")
             
-            # Use GET request with range header to avoid downloading entire file
+            # Use GET request with range header and longer timeout for streaming URLs
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Range': 'bytes=0-999'  # Get first 1000 bytes to check
+                'Range': 'bytes=0-1999',  # Get first 2000 bytes to check
+                'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8'
             }
             
-            response = requests.get(url, headers=headers, timeout=30, stream=True)
+            # For googlevideo.com URLs, use longer timeout
+            timeout = 45 if 'googlevideo.com' in url else 30
             
-            logger.info(f"📡 Direct URL Response Status: {response.status_code}")
-            logger.info(f"📡 Content-Type: {response.headers.get('content-type', 'unknown')}")
-            
-            if response.status_code in [200, 206]:  # 206 is Partial Content
-                content_type = response.headers.get('content-type', 'unknown')
-                content_length = response.headers.get('content-length', 0)
+            try:
+                response = requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
                 
-                # For direct URLs, we'll try to download anyway even if content-type check fails
-                # Some servers don't provide proper content-type headers
-                logger.info(f"✅ Direct video accessible - Size: {content_length}, Type: {content_type}")
+                logger.info(f"📡 Direct URL Response Status: {response.status_code}")
+                logger.info(f"📡 Content-Type: {response.headers.get('content-type', 'unknown')}")
+                logger.info(f"📡 Content-Length: {response.headers.get('content-length', 'unknown')}")
                 
+                if response.status_code in [200, 206]:  # 206 is Partial Content
+                    content_type = response.headers.get('content-type', 'unknown')
+                    content_length = response.headers.get('content-length', 0)
+                    
+                    logger.info(f"✅ Direct video accessible - Size: {content_length}, Type: {content_type}")
+                    
+                    return {
+                        'success': True,
+                        'download_url': url,
+                        'original_url': url,
+                        'type': 'direct',
+                        'content_type': content_type,
+                        'content_length': content_length,
+                        'requires_streaming': True,
+                        'is_googlevideo': 'googlevideo.com' in url
+                    }
+                else:
+                    error_msg = f"Direct video not accessible - Status: {response.status_code}"
+                    logger.error(f"❌ {error_msg}")
+                    return {'success': False, 'error': error_msg}
+                    
+            except requests.exceptions.Timeout:
+                # Even if timeout occurs, we'll still try to download (streaming servers can be slow)
+                logger.warning("⚠️ Initial check timeout, but will attempt download anyway")
                 return {
                     'success': True,
                     'download_url': url,
                     'original_url': url,
                     'type': 'direct',
-                    'content_type': content_type,
-                    'content_length': content_length,
-                    'requires_streaming': True
+                    'content_type': 'video/mp4',
+                    'content_length': 0,
+                    'requires_streaming': True,
+                    'is_googlevideo': 'googlevideo.com' in url,
+                    'slow_server': True
                 }
-            else:
-                error_msg = f"Direct video not accessible - Status: {response.status_code}"
-                logger.error(f"❌ {error_msg}")
-                return {'success': False, 'error': error_msg}
             
-    except requests.exceptions.Timeout:
-        error_msg = "Request timeout - Endpoint not responding"
-        logger.error(f"❌ {error_msg}")
-        return {'success': False, 'error': error_msg}
     except requests.exceptions.ConnectionError:
         error_msg = "Connection error - Cannot reach endpoint"
         logger.error(f"❌ {error_msg}")
@@ -172,7 +177,7 @@ def get_video_info(url):
         logger.error(f"❌ {error_msg}")
         return {'success': False, 'error': error_msg}
 
-def download_video_with_progress(download_url, chat_id, message_id, token, is_direct_url=False):
+def download_video_with_progress(download_url, chat_id, message_id, token, video_info):
     """Download video with progress tracking"""
     try:
         logger.info(f"📥 Starting download from: {download_url}")
@@ -181,7 +186,7 @@ def download_video_with_progress(download_url, chat_id, message_id, token, is_di
         download_progress[chat_id] = {'status': 'downloading', 'progress': 0}
         
         # Send initial progress
-        send_progress_update(chat_id, message_id, token, 0, "Starting download...")
+        send_progress_update(chat_id, message_id, token, 0, "Connecting to video server...")
         
         # Set headers for the download
         headers = {
@@ -193,17 +198,21 @@ def download_video_with_progress(download_url, chat_id, message_id, token, is_di
         }
         
         # For direct URLs, add referer and other headers to avoid restrictions
-        if is_direct_url:
+        if video_info.get('type') == 'direct':
             headers.update({
-                'Referer': 'https://www.google.com/',
-                'Origin': 'https://www.google.com',
+                'Referer': 'https://www.youtube.com/',
+                'Origin': 'https://www.youtube.com',
                 'Sec-Fetch-Dest': 'video',
                 'Sec-Fetch-Mode': 'no-cors',
                 'Sec-Fetch-Site': 'cross-site',
             })
         
+        # Longer timeout for googlevideo.com and streaming servers
+        timeout = 120 if video_info.get('is_googlevideo') or video_info.get('slow_server') else 60
+        
         # Download the video with GET request
-        response = requests.get(download_url, headers=headers, stream=True, timeout=60)
+        logger.info(f"⏳ Setting download timeout: {timeout} seconds")
+        response = requests.get(download_url, headers=headers, stream=True, timeout=timeout)
         response.raise_for_status()
         
         total_size = int(response.headers.get('content-length', 0))
@@ -234,24 +243,33 @@ def download_video_with_progress(download_url, chat_id, message_id, token, is_di
         
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
         downloaded_size = 0
+        last_progress_update = 0
+        chunk_count = 0
         
-        for chunk in response.iter_content(chunk_size=8192):
+        send_progress_update(chat_id, message_id, token, 0, "Downloading video...")
+        
+        for chunk in response.iter_content(chunk_size=32768):  # Larger chunk size for better performance
             if chunk:
                 temp_file.write(chunk)
                 downloaded_size += len(chunk)
+                chunk_count += 1
                 
                 # Update progress
                 if total_size > 0:
                     progress = (downloaded_size / total_size) * 100
                     current_progress = int(progress)
                     
-                    # Update progress every 10% or when complete
-                    if current_progress % 10 == 0 or current_progress == 100:
+                    # Update progress every 5% or when complete, and every 50 chunks
+                    if (current_progress >= last_progress_update + 5 or current_progress == 100 or chunk_count % 50 == 0):
                         download_progress[chat_id] = {
                             'status': 'downloading', 
-                            'progress': current_progress
+                            'progress': current_progress,
+                            'downloaded_mb': downloaded_size / (1024*1024),
+                            'total_mb': total_size / (1024*1024)
                         }
-                        send_progress_update(chat_id, message_id, token, current_progress, "Downloading...")
+                        send_progress_update(chat_id, message_id, token, current_progress, 
+                                           f"Downloading: {downloaded_size/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB")
+                        last_progress_update = current_progress
         
         temp_file.close()
         
@@ -266,6 +284,12 @@ def download_video_with_progress(download_url, chat_id, message_id, token, is_di
         
         return temp_file.name
         
+    except requests.exceptions.Timeout:
+        error_msg = "Download timeout - Server took too long to respond"
+        logger.error(f"❌ {error_msg}")
+        download_progress[chat_id] = {'status': 'error', 'error': error_msg}
+        send_progress_update(chat_id, message_id, token, 0, f"❌ {error_msg}")
+        return None
     except Exception as e:
         logger.error(f"❌ Download error: {e}")
         download_progress[chat_id] = {'status': 'error', 'error': str(e)}
@@ -312,6 +336,9 @@ def send_video_to_telegram(chat_id, video_path, original_url, token):
         file_size = os.path.getsize(video_path)
         logger.info(f"📤 Uploading video: {file_size} bytes")
         
+        # Longer timeout for large files
+        timeout = 180 if file_size > 10 * 1024 * 1024 else 120
+        
         with open(video_path, 'rb') as video_file:
             files = {'video': video_file}
             data = {
@@ -319,7 +346,7 @@ def send_video_to_telegram(chat_id, video_path, original_url, token):
                 'caption': f"🎥 Downloaded Video\n\n🔗 Source: {original_url[:100]}...",
                 'parse_mode': 'HTML'
             }
-            response = requests.post(url, files=files, data=data, timeout=120)
+            response = requests.post(url, files=files, data=data, timeout=timeout)
             
         logger.info(f"📤 Upload response: {response.status_code}")
         
@@ -339,13 +366,18 @@ def start_download_thread(chat_id, video_url, message_id, token):
         try:
             logger.info(f"🎬 Processing video URL: {video_url}")
             
+            # Send initial status
+            send_telegram_message_direct(chat_id, token, "🔍 Analyzing video URL...")
+            
             # Get video info with detailed logging
             video_info = get_video_info(video_url)
             
             if not video_info['success']:
                 # Even if get_video_info fails, try direct download for certain URLs
-                if 'googlevideo.com' in video_url or 'video' in video_url.lower():
+                if 'googlevideo.com' in video_url or 'videoplayback' in video_url:
                     logger.info("🔄 Trying direct download despite initial check failure...")
+                    send_telegram_message_direct(chat_id, token, "🔄 Connecting to streaming server (this may take a moment)...")
+                    
                     video_info = {
                         'success': True,
                         'download_url': video_url,
@@ -353,7 +385,9 @@ def start_download_thread(chat_id, video_url, message_id, token):
                         'type': 'direct',
                         'content_type': 'video/mp4',
                         'content_length': 0,
-                        'requires_streaming': True
+                        'requires_streaming': True,
+                        'is_googlevideo': 'googlevideo.com' in video_url,
+                        'slow_server': True
                     }
                 else:
                     error_details = f"""
@@ -368,7 +402,6 @@ def start_download_thread(chat_id, video_url, message_id, token):
 • Check if the video is available
 • Try a different URL
 • The video might be restricted or private
-• Make sure the URL points directly to a video file
                     """
                     send_telegram_message_direct(chat_id, token, error_details)
                     return
@@ -377,26 +410,40 @@ def start_download_thread(chat_id, video_url, message_id, token):
             video_type = "YouTube" if video_info['type'] == 'youtube' else "Direct Video"
             file_size_mb = int(video_info.get('content_length', 0)) / (1024*1024) if video_info.get('content_length', 0) else 0
             
-            info_text = f"""
+            # Special message for slow streaming servers
+            if video_info.get('slow_server') or video_info.get('is_googlevideo'):
+                info_text = f"""
+✅ <b>Streaming Video Found!</b>
+
+📹 <b>Video Information:</b>
+• <b>Type:</b> {video_type}
+• <b>Content Type:</b> {video_info.get('content_type', 'Unknown')}
+• <b>Estimated Size:</b> {file_size_mb:.2f} MB if available
+
+⚠️ <b>Note:</b> This is a streaming video. Download may take some time...
+⏳ <b>Starting download...</b>
+                """
+            else:
+                info_text = f"""
 ✅ <b>Video Found!</b>
 
 📹 <b>Video Information:</b>
 • <b>Type:</b> {video_type}
 • <b>Content Type:</b> {video_info.get('content_type', 'Unknown')}
-• <b>File Size:</b> {file_size_mb:.2f} MB if available
+• <b>File Size:</b> {file_size_mb:.2f} MB
 
 ⏳ <b>Starting download...</b>
-            """
+                """
+            
             send_telegram_message_direct(chat_id, token, info_text)
             
             # Download video
-            is_direct_url = video_info['type'] == 'direct'
             video_path = download_video_with_progress(
                 video_info['download_url'], 
                 chat_id, 
                 message_id,
                 token,
-                is_direct_url=is_direct_url
+                video_info
             )
             
             if not video_path:
@@ -511,7 +558,7 @@ I can download videos from various sources and send them to you!
 • YouTube (all formats)
 • Direct video links (.mp4, .webm, etc.)
 • Google Video links
-• Any URL that points to a video file
+• Streaming video URLs
 
 ⚡ <b>Commands:</b>
 /start - Show this help
@@ -522,7 +569,7 @@ I can download videos from various sources and send them to you!
 <code>/download https://example.com/video.mp4</code>
 <code>/download https://googlevideo.com/...long_url...</code>
 
-⚠️ <b>Note:</b> Some videos might not be available due to restrictions.
+⚠️ <b>Note:</b> Streaming videos may take longer to download.
                 """
                 
                 return jsonify(send_telegram_message(
@@ -543,7 +590,7 @@ I can download videos from various sources and send them to you!
                 return process_video_download(chat_id, video_url, token)
 
             # Direct URL processing (without /download command)
-            elif extract_youtube_id(message_text) or 'video' in message_text.lower() or any(ext in message_text.lower() for ext in ['.mp4', '.webm', '.avi', '.mov']):
+            elif extract_youtube_id(message_text) or 'video' in message_text.lower() or any(ext in message_text.lower() for ext in ['.mp4', '.webm', '.avi', '.mov']) or 'googlevideo.com' in message_text:
                 return process_video_download(chat_id, message_text, token)
 
             # Unknown message
