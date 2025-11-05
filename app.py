@@ -7,7 +7,6 @@ import tempfile
 import threading
 import time
 import json
-import mimetypes
 import urllib.parse
 
 # লগিং কনফিগারেশন
@@ -451,9 +450,6 @@ def start_download_thread(chat_id, video_url, message_id, token):
     thread.daemon = True
     thread.start()
 
-# ... (rest of the Flask app routes remain the same as previous version)
-# The routes from the previous code should be kept as they are
-
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
     try:
@@ -481,6 +477,8 @@ def handle_request():
             
             if not update:
                 return jsonify({'error': 'Invalid JSON data'}), 400
+            
+            logger.info(f"📩 Update received")
             
             # মেসেজ ডেটা এক্সট্র্যাক্ট
             chat_id = None
@@ -618,6 +616,27 @@ def health_check():
         'worker_endpoint': WORKER_ENDPOINT,
         'timestamp': time.time()
     })
+
+@app.route('/webhook', methods=['POST'])
+def set_webhook():
+    """টেলিগ্রাম ওয়েবহুক সেটআপ করার জন্য এন্ডপয়েন্ট"""
+    try:
+        token = request.args.get('token')
+        webhook_url = request.args.get('url')
+        
+        if not token or not webhook_url:
+            return jsonify({'error': 'Token and URL required'}), 400
+        
+        # Set webhook
+        set_webhook_url = f"https://api.telegram.org/bot{token}/setWebhook"
+        data = {'url': f"{webhook_url}?token={token}"}
+        response = requests.post(set_webhook_url, data=data, timeout=10)
+        
+        return jsonify(response.json())
+        
+    except Exception as e:
+        logger.error(f'Webhook error: {e}')
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
