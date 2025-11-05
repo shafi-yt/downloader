@@ -6,8 +6,7 @@ import re
 import tempfile
 import threading
 import time
-import urllib.parse
-from urllib.parse import urlencode
+import json
 
 # লগিং কনফিগারেশন
 logging.basicConfig(
@@ -21,9 +20,8 @@ app = Flask(__name__)
 # Worker endpoint from your provided link
 WORKER_ENDPOINT = "https://utubdbot.shafitest.workers.dev/"
 
-# Store download progress and user sessions
+# Store download progress
 download_progress = {}
-user_sessions = {}
 
 def send_telegram_message(chat_id, text, parse_mode='HTML', reply_markup=None):
     """
@@ -40,29 +38,6 @@ def send_telegram_message(chat_id, text, parse_mode='HTML', reply_markup=None):
         message_data['reply_markup'] = reply_markup
     
     return message_data
-
-def send_telegram_video(chat_id, video_path, caption=None):
-    """
-    Telegram-এ ভিডিও সেন্ড করার জন্য ফাংশন
-    """
-    return {
-        'method': 'sendVideo',
-        'chat_id': chat_id,
-        'video': open(video_path, 'rb'),
-        'caption': caption,
-        'parse_mode': 'HTML'
-    }
-
-def create_keyboard(buttons):
-    """
-    টেলিগ্রাম কীবোর্ড তৈরি করার ফাংশন
-    """
-    keyboard = {
-        'keyboard': buttons,
-        'resize_keyboard': True,
-        'one_time_keyboard': False
-    }
-    return keyboard
 
 def extract_youtube_id(url):
     """Extract YouTube video ID from various URL formats"""
@@ -81,39 +56,65 @@ def extract_youtube_id(url):
 def get_video_info(video_id):
     """Get video information using the worker endpoint"""
     try:
-        # Construct the worker URL
-        worker_url = f"{WORKER_ENDPOINT}?url=https://youtu.be/{video_id}.mp4"
+        # Construct the worker URL - FIXED: removed .mp4 extension from YouTube URL
+        worker_url = f"{WORKER_ENDPOINT}?url=https://youtu.be/{video_id}"
         
-        # Get video info (we'll use HEAD request to check availability)
+        logger.info(f"🔍 Checking video info for: {worker_url}")
+        
+        # Get video info with detailed debugging
         response = requests.head(worker_url, allow_redirects=True, timeout=30)
         
+        logger.info(f"📡 Response Status: {response.status_code}")
+        logger.info(f"📡 Response Headers: {dict(response.headers)}")
+        
         if response.status_code == 200:
+            content_length = response.headers.get('content-length', 0)
+            content_type = response.headers.get('content-type', 'unknown')
+            
+            logger.info(f"✅ Video available - Size: {content_length}, Type: {content_type}")
+            
             return {
                 'success': True,
                 'download_url': worker_url,
                 'video_id': video_id,
-                'content_type': response.headers.get('content-type', 'video/mp4'),
-                'content_length': response.headers.get('content-length', 0)
+                'content_type': content_type,
+                'content_length': content_length
             }
         else:
-            return {'success': False, 'error': 'Video not available'}
+            error_msg = f"Video not available - Status: {response.status_code}"
+            logger.error(f"❌ {error_msg}")
+            return {'success': False, 'error': error_msg}
             
+    except requests.exceptions.Timeout:
+        error_msg = "Request timeout - Worker endpoint not responding"
+        logger.error(f"❌ {error_msg}")
+        return {'success': False, 'error': error_msg}
+    except requests.exceptions.ConnectionError:
+        error_msg = "Connection error - Cannot reach worker endpoint"
+        logger.error(f"❌ {error_msg}")
+        return {'success': False, 'error': error_msg}
     except Exception as e:
-        logger.error(f"Error getting video info: {e}")
-        return {'success': False, 'error': str(e)}
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        return {'success': False, 'error': error_msg}
 
 def download_video_with_progress(download_url, chat_id, message_id, token):
     """Download video with progress tracking"""
     try:
+        logger.info(f"📥 Starting download from: {download_url}")
+        
         # Update progress
         download_progress[chat_id] = {'status': 'downloading', 'progress': 0}
         
         # Send initial progress
-        send_progress_update(chat_id, message_id, token, 0, "Downloading...")
+        send_progress_update(chat_id, message_id, token, 0, "Starting download...")
         
-        # Download the video
+        # Download the video with GET request
         response = requests.get(download_url, stream=True, timeout=60)
+        response.raise_for_status()
+        
         total_size = int(response.headers.get('content-length', 0))
+        logger.info(f"📦 Total size: {total_size} bytes")
         
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
         downloaded_size = 0
@@ -123,25 +124,36 @@ def download_video_with_progress(download_url, chat_id, message_id, token):
                 temp_file.write(chunk)
                 downloaded_size += len(chunk)
                 
-                # Update progress every 5%
+                # Update progress
                 if total_size > 0:
                     progress = (downloaded_size / total_size) * 100
-                    if int(progress) % 5 == 0 or progress == 100:
+                    current_progress = int(progress)
+                    
+                    # Update progress every 10% or when complete
+                    if current_progress % 10 == 0 or current_progress == 100:
                         download_progress[chat_id] = {
                             'status': 'downloading', 
-                            'progress': int(progress)
+                            'progress': current_progress
                         }
-                        send_progress_update(chat_id, message_id, token, int(progress), "Downloading...")
+                        send_progress_update(chat_id, message_id, token, current_progress, "Downloading...")
         
         temp_file.close()
+        
+        # Check if file was actually downloaded
+        file_size = os.path.getsize(temp_file.name)
+        logger.info(f"💾 File downloaded: {file_size} bytes")
+        
+        if file_size == 0:
+            raise Exception("Downloaded file is empty")
+        
         download_progress[chat_id] = {'status': 'completed', 'progress': 100}
         
         return temp_file.name
         
     except Exception as e:
-        logger.error(f"Download error: {e}")
+        logger.error(f"❌ Download error: {e}")
         download_progress[chat_id] = {'status': 'error', 'error': str(e)}
-        send_progress_update(chat_id, message_id, token, 0, f"Error: {str(e)}")
+        send_progress_update(chat_id, message_id, token, 0, f"Download Error: {str(e)}")
         return None
 
 def send_progress_update(chat_id, message_id, token, progress, status):
@@ -160,6 +172,51 @@ def send_progress_update(chat_id, message_id, token, progress, status):
     except Exception as e:
         logger.error(f"Progress update error: {e}")
 
+def send_telegram_message_direct(chat_id, token, text, parse_mode='HTML'):
+    """Send message directly to Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': parse_mode
+        }
+        response = requests.post(url, json=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Direct message error: {e}")
+        return None
+
+def send_video_to_telegram(chat_id, video_path, original_url, token):
+    """Send video file to Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendVideo"
+        
+        # Get file size for logging
+        file_size = os.path.getsize(video_path)
+        logger.info(f"📤 Uploading video: {file_size} bytes")
+        
+        with open(video_path, 'rb') as video_file:
+            files = {'video': video_file}
+            data = {
+                'chat_id': chat_id,
+                'caption': f"🎥 Downloaded YouTube Video\n\n🔗 Original: {original_url}",
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, files=files, data=data, timeout=120)
+            
+        logger.info(f"📤 Upload response: {response.status_code}")
+        
+        if response.status_code == 200:
+            return True
+        else:
+            logger.error(f"❌ Video upload failed: {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Video upload error: {e}")
+        return False
+
 def start_download_thread(chat_id, youtube_url, message_id, token):
     """Start download in separate thread"""
     def download_job():
@@ -167,14 +224,43 @@ def start_download_thread(chat_id, youtube_url, message_id, token):
             # Extract video ID
             video_id = extract_youtube_id(youtube_url)
             if not video_id:
-                send_telegram_message_direct(chat_id, token, "❌ Invalid YouTube URL")
+                send_telegram_message_direct(chat_id, token, "❌ Invalid YouTube URL. Please check the URL format.")
                 return
             
-            # Get video info
+            logger.info(f"🎬 Processing YouTube video: {video_id}")
+            
+            # Get video info with detailed logging
             video_info = get_video_info(video_id)
+            
             if not video_info['success']:
-                send_telegram_message_direct(chat_id, token, "❌ Could not fetch video information")
+                error_details = f"""
+❌ <b>Could not fetch video information</b>
+
+🔍 <b>Error Details:</b>
+• <b>Video ID:</b> <code>{video_id}</code>
+• <b>Error:</b> {video_info['error']}
+• <b>Worker Endpoint:</b> {WORKER_ENDPOINT}
+
+📝 <b>Possible Solutions:</b>
+• Check if the video is available on YouTube
+• Try a different YouTube URL
+• The video might be restricted or private
+                """
+                send_telegram_message_direct(chat_id, token, error_details)
                 return
+            
+            # Send video info to user
+            info_text = f"""
+✅ <b>Video Found!</b>
+
+📹 <b>Video Information:</b>
+• <b>Video ID:</b> <code>{video_info['video_id']}</code>
+• <b>Content Type:</b> {video_info['content_type']}
+• <b>File Size:</b> {int(video_info['content_length']) / (1024*1024):.2f} MB
+
+⏳ <b>Starting download...</b>
+            """
+            send_telegram_message_direct(chat_id, token, info_text)
             
             # Download video
             video_path = download_video_with_progress(
@@ -185,14 +271,14 @@ def start_download_thread(chat_id, youtube_url, message_id, token):
             )
             
             if not video_path:
-                send_telegram_message_direct(chat_id, token, "❌ Download failed")
+                send_telegram_message_direct(chat_id, token, "❌ Download failed. Please try again later.")
                 return
             
             # Send uploading status
             send_progress_update(chat_id, message_id, token, 100, "Uploading to Telegram...")
             
             # Send video to Telegram
-            send_video_to_telegram(chat_id, video_path, youtube_url, token)
+            upload_success = send_video_to_telegram(chat_id, video_path, youtube_url, token)
             
             # Clean up
             try:
@@ -207,10 +293,24 @@ def start_download_thread(chat_id, youtube_url, message_id, token):
                 requests.post(url, json=data, timeout=10)
             except:
                 pass
+            
+            if upload_success:
+                send_telegram_message_direct(chat_id, token, "✅ <b>Video successfully sent!</b>")
+            else:
+                send_telegram_message_direct(chat_id, token, "❌ <b>Failed to upload video to Telegram.</b>")
                 
         except Exception as e:
-            logger.error(f"Download thread error: {e}")
-            send_telegram_message_direct(chat_id, token, f"❌ Error: {str(e)}")
+            logger.error(f"❌ Download thread error: {e}")
+            error_text = f"""
+❌ <b>Download Failed</b>
+
+🔍 <b>Error Details:</b>
+• <b>Error Type:</b> {type(e).__name__}
+• <b>Error Message:</b> {str(e)}
+
+📝 <b>Please try again later or contact support.</b>
+            """
+            send_telegram_message_direct(chat_id, token, error_text)
         finally:
             # Clean up progress data
             if chat_id in download_progress:
@@ -219,43 +319,6 @@ def start_download_thread(chat_id, youtube_url, message_id, token):
     thread = threading.Thread(target=download_job)
     thread.daemon = True
     thread.start()
-
-def send_telegram_message_direct(chat_id, token, text, parse_mode='HTML'):
-    """Send message directly to Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': parse_mode
-        }
-        requests.post(url, json=data, timeout=10)
-    except Exception as e:
-        logger.error(f"Direct message error: {e}")
-
-def send_video_to_telegram(chat_id, video_path, original_url, token):
-    """Send video file to Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendVideo"
-        
-        with open(video_path, 'rb') as video_file:
-            files = {'video': video_file}
-            data = {
-                'chat_id': chat_id,
-                'caption': f"🎥 Downloaded YouTube Video\n\n🔗 Original: {original_url}",
-                'parse_mode': 'HTML'
-            }
-            response = requests.post(url, files=files, data=data, timeout=60)
-            
-        if response.status_code != 200:
-            logger.error(f"Video send error: {response.text}")
-            send_telegram_message_direct(chat_id, token, "❌ Failed to upload video")
-        else:
-            send_telegram_message_direct(chat_id, token, "✅ Video sent successfully!")
-            
-    except Exception as e:
-        logger.error(f"Video upload error: {e}")
-        send_telegram_message_direct(chat_id, token, f"❌ Upload error: {str(e)}")
 
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
@@ -274,7 +337,8 @@ def handle_request():
             return jsonify({
                 'status': 'YouTube Downloader Bot is running',
                 'endpoint': WORKER_ENDPOINT,
-                'token_received': True
+                'token_received': True,
+                'message': 'Use POST method for Telegram webhook'
             })
 
         # POST request হ্যান্ডেল
@@ -284,30 +348,22 @@ def handle_request():
             if not update:
                 return jsonify({'error': 'Invalid JSON data'}), 400
             
-            logger.info(f"Update received: {update}")
+            logger.info(f"📩 Update received: {json.dumps(update, indent=2)}")
             
             # মেসেজ ডেটা এক্সট্র্যাক্ট
             chat_id = None
             message_text = ''
             message_id = None
-            user_info = {}
             
             if 'message' in update:
                 chat_id = update['message']['chat']['id']
                 message_text = update['message'].get('text', '')
                 message_id = update['message'].get('message_id')
-                user_info = update['message'].get('from', {})
             else:
                 return jsonify({'ok': True})
 
             if not chat_id:
                 return jsonify({'error': 'Chat ID not found'}), 400
-
-            # Main menu keyboard
-            main_keyboard = create_keyboard([
-                ["📥 Download YouTube Video"],
-                ["ℹ️ Help", "❌ Cancel"]
-            ])
 
             # /start কমান্ড হ্যান্ডেল
             if message_text.startswith('/start'):
@@ -317,61 +373,36 @@ def handle_request():
 I can download YouTube videos and send them to you!
 
 📌 <b>How to use:</b>
-1. Send any YouTube video URL
-2. Or click <b>Download YouTube Video</b>
-3. I'll download and send you the video
+Just send me any YouTube video URL and I'll download it for you.
 
-🔗 <b>Supported formats:</b>
-• youtube.com/watch?v=...
-• youtu.be/...
-• youtube.com/embed/...
+🔗 <b>Supported URL formats:</b>
+• https://youtu.be/FbcHYg4Qx7o
+• https://www.youtube.com/watch?v=FbcHYg4Qx7o
+• https://youtube.com/embed/FbcHYg4Qx7o
 
-⚠️ <b>Note:</b> Maximum video size 50MB
-                """
+⚠️ <b>Note:</b> Some videos might not be available due to restrictions.
+
+🔍 <b>Debug Info:</b>
+• Worker Endpoint: <code>{}</code>
+• Bot Status: ✅ Running
+
+📝 <b>Just send a YouTube URL to get started!</b>
+                """.format(WORKER_ENDPOINT)
                 
                 return jsonify(send_telegram_message(
                     chat_id=chat_id,
-                    text=welcome_text,
-                    reply_markup=main_keyboard
-                ))
-
-            # Help command
-            elif message_text == 'ℹ️ Help':
-                return jsonify(send_telegram_message(
-                    chat_id=chat_id,
-                    text="Send me a YouTube URL or click 'Download YouTube Video' to start!",
-                    reply_markup=main_keyboard
-                ))
-
-            # Cancel command
-            elif message_text == '❌ Cancel':
-                if chat_id in download_progress:
-                    del download_progress[chat_id]
-                if chat_id in user_sessions:
-                    del user_sessions[chat_id]
-                    
-                return jsonify(send_telegram_message(
-                    chat_id=chat_id,
-                    text="❌ Operation cancelled.",
-                    reply_markup=main_keyboard
-                ))
-
-            # Download YouTube Video button
-            elif message_text == '📥 Download YouTube Video':
-                return jsonify(send_telegram_message(
-                    chat_id=chat_id,
-                    text="🔗 <b>Send YouTube URL</b>\n\nPlease send me the YouTube video link you want to download.",
-                    reply_markup=create_keyboard([["❌ Cancel"]])
+                    text=welcome_text
                 ))
 
             # YouTube URL processing
-            elif extract_youtube_id(message_text):
+            youtube_id = extract_youtube_id(message_text)
+            if youtube_id:
                 youtube_url = message_text
                 
                 # Send initial processing message
                 processing_msg = send_telegram_message(
                     chat_id=chat_id,
-                    text="🔍 Processing YouTube video..."
+                    text="🔍 Processing YouTube video...\n\n📝 Checking video availability..."
                 )
                 
                 # Send the processing message and get its message ID
@@ -388,41 +419,42 @@ I can download YouTube videos and send them to you!
                 else:
                     return jsonify(send_telegram_message(
                         chat_id=chat_id,
-                        text="❌ Failed to start download process"
+                        text="❌ Failed to start download process. Please try again."
                     ))
 
             # Unknown message
             else:
                 return jsonify(send_telegram_message(
                     chat_id=chat_id,
-                    text="❌ Please send a valid YouTube URL or use the menu buttons.",
-                    reply_markup=main_keyboard
+                    text="❌ Please send a valid YouTube URL.\n\nUse /start to see supported formats."
                 ))
 
     except Exception as e:
-        logger.error(f'Error: {e}')
-        return jsonify({'error': 'Processing failed'}), 500
+        logger.error(f'❌ Main handler error: {e}')
+        return jsonify({'error': 'Processing failed', 'details': str(e)}), 500
 
-@app.route('/webhook', methods=['POST'])
-def set_webhook():
-    """টেলিগ্রাম ওয়েবহুক সেটআপ করার জন্য এন্ডপয়েন্ট"""
-    try:
-        token = request.args.get('token')
-        webhook_url = request.args.get('url')
-        
-        if not token or not webhook_url:
-            return jsonify({'error': 'Token and URL required'}), 400
-        
-        # Set webhook
-        set_webhook_url = f"https://api.telegram.org/bot{token}/setWebhook"
-        data = {'url': webhook_url}
-        response = requests.post(set_webhook_url, data=data, timeout=10)
-        
-        return jsonify(response.json())
-        
-    except Exception as e:
-        logger.error(f'Webhook error: {e}')
-        return jsonify({'error': str(e)}), 500
+@app.route('/debug', methods=['GET'])
+def debug_endpoint():
+    """ডিবাগিং এন্ডপয়েন্ট"""
+    token = request.args.get('token')
+    url = request.args.get('url')
+    
+    if not url:
+        return jsonify({'error': 'URL parameter required'})
+    
+    youtube_id = extract_youtube_id(url)
+    if not youtube_id:
+        return jsonify({'error': 'Invalid YouTube URL'})
+    
+    # Get video info
+    video_info = get_video_info(youtube_id)
+    
+    return jsonify({
+        'youtube_url': url,
+        'youtube_id': youtube_id,
+        'worker_url': f"{WORKER_ENDPOINT}?url=https://youtu.be/{youtube_id}",
+        'video_info': video_info
+    })
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -430,7 +462,8 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'YouTube Telegram Bot',
-        'worker_endpoint': WORKER_ENDPOINT
+        'worker_endpoint': WORKER_ENDPOINT,
+        'timestamp': time.time()
     })
 
 if __name__ == '__main__':
