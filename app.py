@@ -13,6 +13,7 @@ from flask import Flask, request, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlparse, parse_qs
 
 # ----------------------------
 # Logging
@@ -92,8 +93,9 @@ def get_streaming_headers(referer: str | None = None):
         "DNT": "1",
     }
     if referer:
+        ru = urllib.parse.urlparse(referer)
         headers["Referer"] = referer
-        headers["Origin"] = urllib.parse.urlparse(referer).scheme + "://" + urllib.parse.urlparse(referer).netloc
+        headers["Origin"] = f"{ru.scheme}://{ru.netloc}"
     return headers
 
 
@@ -131,6 +133,36 @@ def is_streaming_url(url: str) -> bool:
 def is_manifest(url: str) -> bool:
     ul = url.lower()
     return (ul.endswith(".m3u8") or ".m3u8" in ul or ul.endswith(".mpd") or ".mpd" in ul)
+
+
+def is_ip_bound_googlevideo(url: str) -> bool:
+    try:
+        q = parse_qs(urlparse(url).query)
+        # ip=, spc=, expire= থাকলে সাধারণত সাইনেচার time/IP bound
+        return any(k in q for k in ("ip", "spc", "expire"))
+    except Exception:
+        return False
+
+
+# ----------------------------
+# Google Video special headers
+# ----------------------------
+ANDROID_YT_UA = (
+    "com.google.android.youtube/19.32.39 (Linux; U; Android 13) gzip, ExoPlayerLib/2.19"
+)
+
+def build_googlevideo_headers(url: str):
+    """
+    Google Video লিংকের জন্য একটু 'realistic' হেডার।
+    """
+    h = get_streaming_headers(referer="https://www.youtube.com/")
+    h["User-Agent"] = ANDROID_YT_UA
+    h["Origin"] = "https://www.youtube.com"
+    h["Sec-Fetch-Dest"] = "video"
+    h["Sec-Fetch-Mode"] = "no-cors"
+    h["Sec-Fetch-Site"] = "cross-site"
+    h["Range"] = "bytes=0-"
+    return h
 
 
 # ----------------------------
@@ -180,7 +212,7 @@ def send_telegram_message_direct(session, chat_id, token, text, parse_mode="HTML
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = {
             "chat_id": chat_id,
-            "text": text[:1024],  # caption/message safety
+            "text": text[:1024],  # safety
             "parse_mode": parse_mode
         }
         resp, j = safe_telegram_post(session, url, json=data)
@@ -238,8 +270,12 @@ def send_as_document(session, chat_id, file_path, original_url, token):
 # ----------------------------
 def test_streaming_url(session, url, referer=None):
     try:
-        headers = get_streaming_headers(referer)
-        # Prefer partial GET probe with Range to detect stream capability
+        # googlevideo হলে স্পেশাল হেডার, নইলে জেনেরিক
+        if "googlevideo.com" in url:
+            headers = build_googlevideo_headers(url)
+        else:
+            headers = get_streaming_headers(referer)
+
         probe_headers = dict(headers)
         probe_headers["Range"] = "bytes=0-1023"
 
@@ -252,6 +288,9 @@ def test_streaming_url(session, url, referer=None):
                 "content_length": r.headers.get("content-length"),
                 "headers": dict(r.headers),
             }
+        elif r.status_code == 403 and "googlevideo.com" in url:
+            reason = "IP-bound/expired Google Video URL (403). Send a fresh link."
+            return {"success": False, "error": "403 Forbidden", "details": reason}
         return {
             "success": False,
             "error": f"HTTP {r.status_code}",
@@ -279,69 +318,81 @@ def detect_extension_from_ctype(ctype: str) -> str:
 
 
 def stream_to_file(session, stream_url, chat_id, message_id, token, referer=None):
-    headers = get_streaming_headers(referer)
-    # Many servers prefer Range; still download full file
-    headers["Range"] = "bytes=0-"
+    # হেডার বাছাই
+    if "googlevideo.com" in stream_url:
+        headers = build_googlevideo_headers(stream_url)
+    else:
+        headers = get_streaming_headers(referer)
+        headers["Range"] = "bytes=0-"
 
-    with session.get(stream_url, headers=headers, stream=True, timeout=(15, 180)) as r:
-        r.raise_for_status()
+    r = session.get(stream_url, headers=headers, stream=True, timeout=(15, 180))
+    if r.status_code == 403 and "googlevideo.com" in stream_url:
+        send_telegram_message_direct(session, chat_id, token,
+            "❌ 403 Forbidden.\n\n🔒 This Google Video link is likely IP-bound or expired.\n"
+            "Please provide a fresh link generated for this server, or another direct video URL.")
+        raise requests.HTTPError("403 Forbidden (likely IP-bound)")
 
-        total = r.headers.get("content-length")
-        try:
-            total = int(total) if total is not None else None
-        except Exception:
-            total = None
+    r.raise_for_status()
 
-        ext = detect_extension_from_ctype(r.headers.get("content-type", ""))
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-        path = tmp.name
+    total = r.headers.get("content-length")
+    try:
+        total = int(total) if total is not None else None
+    except Exception:
+        total = None
 
-        downloaded = 0
-        last_push = 0.0
-        start = time.time()
+    ext = detect_extension_from_ctype(r.headers.get("content-type", ""))
 
-        for chunk in r.iter_content(chunk_size=1024 * 256):  # 256KB
-            if not chunk:
-                continue
-            tmp.write(chunk)
-            downloaded += len(chunk)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    path = tmp.name
 
-            if downloaded > MAX_BYTES:
-                tmp.close()
-                os.unlink(path)
-                raise Exception("File exceeds size limit for Telegram.")
+    downloaded = 0
+    last_push = 0.0
+    start = time.time()
 
-            now = time.time()
-            if now - last_push >= 2:  # debounce ~2s
-                if total:
-                    pct = min(99, int(downloaded * 100 / total))
-                    speed = downloaded / max(1, now - start)
-                    send_progress_update(
-                        session, chat_id, message_id, token, pct,
-                        f"Streaming: {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({speed/1024/1024:.1f} MB/s)"
-                    )
-                else:
-                    # cycling % a bit so UI feels alive
-                    pct = min(99, int((now - start) % 100))
-                    send_progress_update(
-                        session, chat_id, message_id, token, pct,
-                        f"Streaming: {downloaded/(1024*1024):.1f}MB (size unknown)"
-                    )
-                last_push = now
+    for chunk in r.iter_content(chunk_size=1024 * 256):  # 256KB
+        if not chunk:
+            continue
+        tmp.write(chunk)
+        downloaded += len(chunk)
 
-        tmp.close()
-        return path, total
+        if downloaded > MAX_BYTES:
+            tmp.close()
+            os.unlink(path)
+            raise Exception("File exceeds size limit for Telegram.")
+
+        now = time.time()
+        if now - last_push >= 2:  # debounce ~2s
+            if total:
+                pct = min(99, int(downloaded * 100 / total))
+                speed = downloaded / max(1, now - start)
+                send_progress_update(
+                    session, chat_id, message_id, token, pct,
+                    f"Streaming: {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB ({speed/1024/1024:.1f} MB/s)"
+                )
+            else:
+                pct = min(99, int((now - start) % 100))
+                send_progress_update(
+                    session, chat_id, message_id, token, pct,
+                    f"Streaming: {downloaded/(1024*1024):.1f}MB (size unknown)"
+                )
+            last_push = now
+
+    tmp.close()
+    return path, total
 
 
 def handle_streaming_url(session, url, referer=None):
     try:
         if is_manifest(url):
-            # To keep Render-friendly (no ffmpeg), reject manifests gracefully
             return {
                 "success": False,
                 "error": "Stream manifest (.m3u8/.mpd) not supported on this build.",
                 "details": "Transmuxing requires ffmpeg which is not enabled."
             }
+
+        # IP-bound googlevideo হলে আগেই সতর্ক করি (তবু probe করব)
+        if "googlevideo.com" in url and is_ip_bound_googlevideo(url):
+            logger.info("Likely IP-bound Google Video URL; will probe.")
 
         probe = test_streaming_url(session, url, referer=referer)
         if probe.get("success"):
@@ -354,20 +405,19 @@ def handle_streaming_url(session, url, referer=None):
                 "content_length": probe.get("content_length"),
                 "is_streaming": True,
             }
-        # Fallback: still try direct stream
-        return {
-            "success": True,
-            "download_url": url,
-            "original_url": url,
-            "type": "streaming",
-            "content_type": "video/mp4",
-            "content_length": 0,
-            "is_streaming": True,
-            "direct_stream": True,
-        }
+        else:
+            return {
+                "success": False,
+                "error": probe.get("error", "Probe failed"),
+                "details": probe.get("details", "Unknown")
+            }
     except Exception as e:
         logger.error(f"Streaming URL handling error: {e}")
-        return {"success": False, "error": f"Streaming processing failed: {str(e)}", "details": "Cannot process URL"}
+        return {
+            "success": False,
+            "error": f"Streaming processing failed: {str(e)}",
+            "details": "Cannot process URL"
+        }
 
 
 def get_video_info(session, url):
@@ -409,26 +459,31 @@ def get_video_info(session, url):
 def start_download_thread(chat_id, video_url, message_id, token):
     def download_job():
         acquired = DL_SEM.acquire(blocking=False)
+        local_session = make_session()
+
         if not acquired:
-            local_session = make_session()
             send_telegram_message_direct(local_session, chat_id, token,
                 "⏳ Too many downloads in progress. Please try again shortly.")
             return
 
-        local_session = make_session()
         try:
             logger.info(f"🎬 Processing URL: {video_url}")
             send_telegram_message_direct(local_session, chat_id, token, "🔍 Analyzing URL...")
 
             video_info = get_video_info(local_session, video_url)
             if not video_info.get("success"):
+                extra = ""
+                if ("googlevideo.com" in video_url) and (
+                    "403" in str(video_info.get("error","")) or "IP-bound" in str(video_info.get("details",""))
+                ):
+                    extra = ("\n\n💡 Tip: Many Google Video links are bound to the original client IP and expire quickly. "
+                             "Please fetch a fresh link (from the same server) or use a different direct video URL.")
                 msg = f"""❌ <b>Could not process URL</b>
 
 🔍 <b>Details:</b>
 • <b>URL:</b> <code>{video_url[:100]}...</code>
 • <b>Error:</b> {video_info.get('error', 'Unknown')}
-
-⚠️ <b>Note:</b> HLS/DASH manifests (.m3u8/.mpd) are not supported in this build.
+• <b>Info:</b> {video_info.get('details','')}{extra}
 """
                 send_telegram_message_direct(local_session, chat_id, token, msg)
                 return
@@ -495,7 +550,6 @@ def start_download_thread(chat_id, video_url, message_id, token):
                 except Exception:
                     pass
             try:
-                # Clean any temp files lingering (best effort)
                 pass
             finally:
                 if acquired:
@@ -596,6 +650,11 @@ Send me any public video URL (http/https)
 
 def process_video_download(session, chat_id, video_url, token):
     try:
+        if not validate_url_safe(video_url):
+            return jsonify(send_telegram_message_payload(
+                chat_id, "❌ Unsafe or invalid URL. Public http/https only."
+            ))
+
         processing_msg = send_telegram_message_payload(
             chat_id, f"🔍 Processing URL...\n\n<code>{video_url[:100]}...</code>"
         )
@@ -629,5 +688,4 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    # For Render, gunicorn will run this; but keeping flask run for local dev
     app.run(host="0.0.0.0", port=port, debug=False)
