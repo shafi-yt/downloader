@@ -21,8 +21,7 @@
 2. Render → **New** → **Web Service** → রিপো সিলেক্ট
 3. **Build Command**: `pip install -r requirements.txt`  
    **Start Command**: `gunicorn -w 2 -b 0.0.0.0:$PORT app:app`
-4. Env Vars:
-   - `APP_BASE_URL` = Render URL (যেমন `https://your-app.onrender.com`)
+4. Env Vars: (কিছু লাগবে না—এই অ্যাপ টোকেন URL-কোয়েরি থেকেই নেয়)
 5. BotFather থেকে বট তৈরি করুন → TOKEN নিন
 6. Telegram webhook সেটআপ করুন (TOKEN কুয়েরি দিয়ে):
    ```bash
