@@ -1,50 +1,28 @@
 from flask import Flask, request, jsonify
-import os, re, tempfile, threading, subprocess, shlex, glob, logging, json
-import requests
+import os, re, tempfile, threading, subprocess, shlex, glob, logging, json, requests
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
 
 app = Flask(__name__)
 
-# ---------- Helpers (Telegram JSON reply style) ----------
-def webhook_reply_send_message(chat_id, text, parse_mode=None):
-    """
-    Telegram webhook response shortcut:
-    If you return JSON like {"method":"sendMessage", ...}, Telegram will execute it.
-    Use this ONLY for small, immediate acks.
-    """
-    return {
-        'method': 'sendMessage',
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': parse_mode
-    }
-
-# ---------- Generic utilities ----------
+# ---------- Helpers ----------
 YOUTUBE_RE = re.compile(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/\S+', re.I)
 TARGET_LIMIT_MB = 50
 HARD_LIMIT_BYTES = 48 * 1024 * 1024  # buffer under 50MB
 
-def safe_filename(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9\-\.\_\s]+', '_', s).strip()[:120] or "video"
+def webhook_reply_send_message(chat_id, text, parse_mode=None):
+    """Return a Telegram-style JSON to execute sendMessage inline (fallback)."""
+    payload = {
+        'method': 'sendMessage',
+        'chat_id': chat_id,
+        'text': text
+    }
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+    return payload
 
-def guess_file_by_ext(tmpdir: str, exts):
-    candidates = []
-    for ext in exts:
-        candidates.extend(glob.glob(os.path.join(tmpdir, f"*.{ext}")))
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getsize)
-
-def guess_video_file(tmpdir: str):
-    return guess_file_by_ext(tmpdir, ["mp4", "mkv", "webm", "mov"])
-
-def guess_audio_file(tmpdir: str):
-    return guess_file_by_ext(tmpdir, ["m4a", "mp3", "opus", "aac"])
-
-# ---------- Telegram API (active push) ----------
 def tg_api_base(bot_token: str) -> str:
     return f"https://api.telegram.org/bot{bot_token}"
 
@@ -73,9 +51,27 @@ def tg_send_audio_api(bot_token: str, chat_id: int, file_path: str, caption: str
         logger.info("sendAudio status=%s body=%s", getattr(r, 'status_code', None), getattr(r, 'text', None)[:400])
         return r
 
-# ---------- yt-dlp CLI builders ----------
+def safe_filename(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9\-\.\_\s]+', '_', s).strip()[:120] or "video"
+
+def guess_file_by_ext(tmpdir: str, exts):
+    candidates = []
+    for ext in exts:
+        candidates.extend(glob.glob(os.path.join(tmpdir, f"*.{ext}")))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getsize)
+
+def guess_video_file(tmpdir: str):
+    return guess_file_by_ext(tmpdir, ["mp4", "mkv", "webm", "mov"])
+
+def guess_audio_file(tmpdir: str):
+    return guess_file_by_ext(tmpdir, ["m4a", "mp3", "opus", "aac"])
+
+# ---------- yt-dlp CLI ----------
 def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False):
     outtmpl = os.path.join(outdir, safe_filename(title_hint) + ".%(ext)s")
+    # Use valid format filters; avoid regex operators that changed in newer yt-dlp
     default_video_fmt = (
         "best[ext=mp4][vcodec^=avc][filesize<48M]"
         "/best[ext=mp4][height<=480][filesize<48M]"
@@ -150,7 +146,7 @@ def download_with_pytube(url: str, outdir: str):
         raise RuntimeError("File exceeds ~50MB limit")
     return fp
 
-# ---------- Worker (download + upload) ----------
+# ---------- Worker ----------
 def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
     with tempfile.TemporaryDirectory() as tmp:
         try:
@@ -166,9 +162,7 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
                     raise RuntimeError("Audio not found")
                 if os.path.getsize(apath) > HARD_LIMIT_BYTES:
                     raise RuntimeError("Audio exceeds ~50MB")
-                r = tg_send_audio_api(bot_token, chat_id, apath, caption="🎧 Extracted audio")
-                if not r or not r.ok:
-                    tg_send_message_api(bot_token, chat_id, f"❌ আপলোড ব্যর্থ: {r.text if r else 'request failed'}")
+                tg_send_audio_api(bot_token, chat_id, apath, caption="🎧 Extracted audio")
                 return
             elif mode == "360":
                 fmt = "best[ext=mp4][height<=360][filesize<48M]/best[ext=mp4][filesize<48M]"
@@ -177,8 +171,7 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
                 fmt = "best[ext=mp4][height<=720][filesize<48M]/best[ext=mp4][filesize<48M]"
                 path = download_with_ytdlp_cli(url, tmp, fmt=fmt)
             elif mode == "best":
-                fmt = None
-                path = download_with_ytdlp_cli(url, tmp, fmt=fmt)
+                path = download_with_ytdlp_cli(url, tmp, fmt=None)
             else:
                 path = download_with_ytdlp_cli(url, tmp)
 
@@ -191,9 +184,7 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
                 tg_send_message_api(bot_token, chat_id, f"⚠️ ফাইল {size_mb:.1f}MB — সীমা পার হচ্ছে। `/360` বা `/audio` চেষ্টা করুন।")
                 return
 
-            r = tg_send_video_api(bot_token, chat_id, path, caption=f"📥 {mode} ▶ Telegram")
-            if not r or not r.ok:
-                tg_send_message_api(bot_token, chat_id, f"❌ আপলোড ব্যর্থ: {r.text if r else 'request failed'}")
+            tg_send_video_api(bot_token, chat_id, path, caption=f"📥 {mode} ▶ Telegram")
         except Exception as e:
             logger.exception("Processing error")
             tg_send_message_api(bot_token, chat_id, f"❌ ব্যর্থ: {e}")
@@ -201,14 +192,14 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
 # ---------- Command help ----------
 HELP_TEXT = (
     "👋 লিংক দিন এই কমান্ডগুলোর সাথে:\n"
-    "`/ytdlp <url>` – yt-dlp (CLI), ~50MB MP4\n"
-    "`/ytdlpa <url>` – yt_dlp Python API\n"
-    "`/pytube <url>` – pytube/pytubefix fallback\n"
-    "`/audio <url>` – m4a/mp3 (অডিও)\n"
-    "`/360 <url>` – 360p টার্গেট\n"
-    "`/720 <url>` – 720p টার্গেট\n"
-    "`/best <url>` – সীমার মধ্যে সেরা সম্ভব\n\n"
-    "ℹ️ বড় ভিডিও হলে সীমায় আটকাতে পারে। তখন `/360` বা `/audio` ব্যবহার করুন।"
+    "/ytdlp <url> – yt-dlp (CLI), ~50MB MP4\n"
+    "/ytdlpa <url> – yt_dlp Python API\n"
+    "/pytube <url> – pytube/pytubefix fallback\n"
+    "/audio <url> – m4a/mp3 (অডিও)\n"
+    "/360 <url> – 360p টার্গেট\n"
+    "/720 <url> – 720p টার্গেট\n"
+    "/best <url> – সীমার মধ্যে সেরা সম্ভব\n\n"
+    "ℹ️ বড় ভিডিও হলে সীমায় আটকাতে পারে। তখন /360 বা /audio ব্যবহার করুন।"
 )
 
 def parse_cmd(text: str):
@@ -224,110 +215,104 @@ def first_url(s: str):
     return m.group(0) if m else None
 
 # ---------- Single endpoint (GET/POST) with ?token=BOT_TOKEN ----------
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/', methods=['GET', 'HEAD', 'POST'])
 def handle_request():
     try:
-        token = request.args.get('token')  # required per your original style
+        token = request.args.get('token')
+
+        # Health checks
+        if request.method in ('GET', 'HEAD'):
+            return jsonify({'ok': True, 'service': 'telegram-ytdlp-bot'})
+
+        # For incoming updates we require ?token= to know which bot to call
         if not token:
             return jsonify({
                 'error': 'Token required',
-                'solution': 'Add ?token=YOUR_BOT_TOKEN to URL'
+                'solution': 'Add ?token=YOUR_BOT_TOKEN to webhook URL'
             }), 400
 
-        if request.method in ('GET', 'HEAD'):
-            return jsonify({'status': 'Bot is running', 'note': 'Provide ?token=BOT_TOKEN for incoming updates'})
+        # POST update
+        update = request.get_json(silent=True)
+        if not update:
+            return jsonify({'error': 'Invalid JSON data'}), 400
 
-        if request.method == 'POST':
-            update = request.get_json()
-            if not update:
-                return jsonify({'error': 'Invalid JSON data'}), 400
+        logger.info("Update received: %s", json.dumps(update)[:2000])
 
-            logger.info(f"Update received: {json.dumps(update)[:2000]}")
+        chat_id = None
+        message_text = ''
+        user_info = {}
 
-            chat_id = None
-            message_text = ''
-            user_info = {}
+        if 'message' in update:
+            msg = update['message']
+        elif 'edited_message' in update:
+            msg = update['edited_message']
+        else:
+            # ignore channel_post etc.
+            return jsonify({'ok': True})
 
-            if 'message' in update:
-                chat_id = update['message']['chat']['id']
-                message_text = update['message'].get('text', '') or ''
-                user_info = update['message'].get('from', {})
-            elif 'edited_message' in update:
-                chat_id = update['edited_message']['chat']['id']
-                message_text = update['edited_message'].get('text', '') or ''
-                user_info = update['edited_message'].get('from', {})
-            else:
+        chat = msg.get('chat') or {}
+        chat_id = chat.get('id')
+        message_text = (msg.get('text') or "").strip()
+        user_info = msg.get('from', {})
+
+        if not chat_id:
+            return jsonify({'error': 'Chat ID not found'}), 400
+
+        # Commands with optional @Bot suffix
+        if re.match(r'^/start(?:@\w+)?\b', message_text):
+            first_name = user_info.get('first_name', 'অজানা')
+            last_name = user_info.get('last_name', '')
+            username = user_info.get('username', 'অজানা')
+            user_id = user_info.get('id', 'অজানা')
+            language_code = user_info.get('language_code', 'অজানা')
+            full_name = (first_name + (" " + last_name if last_name else ""))
+            profile_text = (
+                "🤖 আপনার প্রোফাইল তথ্য\n\n"
+                f"👤 পূর্ণ নাম: {full_name}\n"
+                f"• ইউজারনেম: @{username}\n"
+                f"• ইউজার আইডি: {user_id}\n"
+                f"• ভাষা: {language_code}\n\n"
+                f"💬 চ্যাট আইডি: {chat_id}\n\n"
+                "🎬 ব্যবহার:\n"
+                "/ytdlp <url>, /ytdlpa <url>, /pytube <url>, /audio <url>, /360 <url>, /720 <url>, /best <url>\n"
+            )
+            tg_send_message_api(token, chat_id, profile_text)
+            return jsonify({'ok': True})
+
+        if re.match(r'^/help(?:@\w+)?\b', message_text):
+            tg_send_message_api(token, chat_id, HELP_TEXT)
+            return jsonify({'ok': True})
+
+        # Router
+        cmd, arg = parse_cmd(message_text)
+        supported = {
+            "/ytdlp": "ytdlp_cli", "/ytdlpa": "ytdlp_api",
+            "/pytube": "pytube", "/audio": "audio",
+            "/360": "360", "/720": "720", "/best": "best"
+        }
+
+        if cmd in supported:
+            url = first_url(arg)
+            if not url:
+                tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: {cmd} <youtube-url>")
                 return jsonify({'ok': True})
+            tg_send_message_api(token, chat_id, f"⏳ প্রসেসিং শুরু… ({supported[cmd]})")
+            threading.Thread(target=process_and_upload, args=(token, chat_id, url, supported[cmd]), daemon=True).start()
+            return jsonify({'ok': True})
 
-            if not chat_id:
-                return jsonify({'error': 'Chat ID not found'}), 400
+        # If just a YouTube URL, default to ytdlp_cli
+        url = first_url(message_text)
+        if url:
+            tg_send_message_api(token, chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)")
+            threading.Thread(target=process_and_upload, args=(token, chat_id, url, "ytdlp_cli"), daemon=True).start()
+            return jsonify({'ok': True})
 
-            # Commands
-            import re as _re
-            if _re.match(r'^/start(?:@\w+)?\b', message_text):
-                first_name = user_info.get('first_name', 'অজানা')
-                last_name = user_info.get('last_name', '')
-                username = user_info.get('username', 'অজানা')
-                user_id = user_info.get('id', 'অজানা')
-                language_code = user_info.get('language_code', 'অজানা')
-                full_name = (first_name + (" " + last_name if last_name else ""))
-                profile_text = f"""
-🤖 *আপনার প্রোফাইল তথ্য*
-
-👤 *ব্যক্তিগত তথ্য:*
-• *পূর্ণ নাম:* {full_name}
-• *ইউজারনেম:* @{username}
-• *ইউজার আইডি:* `{user_id}`
-• *ভাষা:* {language_code}
-
-💬 *চ্যাট তথ্য:*
-• *চ্যাট আইডি:* `{chat_id}`
-
-🎬 *ব্যবহার:*
-/ytdlp <url>, /ytdlpa <url>, /pytube <url>, /audio <url>, /360 <url>, /720 <url>, /best <url>
-                """.strip()
-                tg_send_message_api(token, chat_id, profile_text)
-                return jsonify({'ok': True})
-
-            # Help
-            import re as _re2
-            if _re2.match(r'^/help(?:@\w+)?\b', message_text):
-                tg_send_message_api(token, chat_id, HELP_TEXT)
-                return jsonify({'ok': True})
-
-            # Router
-            cmd, arg = parse_cmd(message_text)
-            supported = {
-                "/ytdlp": "ytdlp_cli", "/ytdlpa": "ytdlp_api",
-                "/pytube": "pytube", "/audio": "audio",
-                "/360": "360", "/720": "720", "/best": "best"
-            }
-
-            # If command + url
-            if cmd in supported:
-                url = first_url(arg)
-                if not url:
-                    tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: {cmd} <youtube-url>")
-                return jsonify({'ok': True})
-                # Immediate ack via webhook response
-                threading.Thread(target=process_and_upload, args=(token, chat_id, url, supported[cmd]), daemon=True).start()
-                return jsonify(webhook_reply_send_message(chat_id, f"⏳ প্রসেসিং শুরু… ({supported[cmd]})"))
-
-            # If just a YouTube URL, default ytdlp_cli
-            url = first_url(message_text)
-            if url:
-                threading.Thread(target=process_and_upload, args=(token, chat_id, url, "ytdlp_cli"), daemon=True).start()
-                r = tg_send_message_api(token, chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)")
-                if not r or not r.ok:
-                    return jsonify(webhook_reply_send_message(chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)"))
-                return jsonify({'ok': True})
-
-            # Fallback
-            tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
-                return jsonify({'ok': True})
+        # Fallback
+        tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। /help দেখুন।")
+        return jsonify({'ok': True})
 
     except Exception as e:
-        logger.exception('Error: %s', e)
+        logger.exception("Error: %s", e)
         return jsonify({'error': 'Processing failed'}), 500
 
 if __name__ == '__main__':
