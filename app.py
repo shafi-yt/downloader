@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ---------- Helpers (Telegram JSON reply style) ----------
-def webhook_reply_send_message(chat_id, text, parse_mode='Markdown'):
+def webhook_reply_send_message(chat_id, text, parse_mode=None):
     """
     Telegram webhook response shortcut:
     If you return JSON like {"method":"sendMessage", ...}, Telegram will execute it.
@@ -49,7 +49,7 @@ def tg_api_base(bot_token: str) -> str:
     return f"https://api.telegram.org/bot{bot_token}"
 
 def tg_send_message_api(bot_token: str, chat_id: int, text: str, **kwargs):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", **kwargs}
+    data = {"chat_id": chat_id, "text": text, **kwargs}
     try:
         r = requests.post(f"{tg_api_base(bot_token)}/sendMessage", json=data, timeout=30)
         logger.info("sendMessage status=%s body=%s", getattr(r, 'status_code', None), getattr(r, 'text', None)[:400])
@@ -77,7 +77,7 @@ def tg_send_audio_api(bot_token: str, chat_id: int, file_path: str, caption: str
 def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False):
     outtmpl = os.path.join(outdir, safe_filename(title_hint) + ".%(ext)s")
     default_video_fmt = (
-        "best[ext=mp4][vcodec~=^avc1|^h264][filesize<48M]"
+        "best[ext=mp4][vcodec^=avc][filesize<48M]"
         "/best[ext=mp4][height<=480][filesize<48M]"
         "/best[ext=mp4][height<=720][filesize<48M]"
         "/best[ext=mp4][filesize<48M]"
@@ -263,7 +263,8 @@ def handle_request():
                 return jsonify({'error': 'Chat ID not found'}), 400
 
             # Commands
-            if message_text.startswith('/start'):
+            import re as _re
+            if _re.match(r'^/start(?:@\w+)?\b', message_text):
                 first_name = user_info.get('first_name', 'অজানা')
                 last_name = user_info.get('last_name', '')
                 username = user_info.get('username', 'অজানা')
@@ -285,16 +286,13 @@ def handle_request():
 🎬 *ব্যবহার:*
 /ytdlp <url>, /ytdlpa <url>, /pytube <url>, /audio <url>, /360 <url>, /720 <url>, /best <url>
                 """.strip()
-                r = tg_send_message_api(token, chat_id, profile_text)
-                if not r or not r.ok:
-                    return jsonify(webhook_reply_send_message(chat_id, profile_text))
+                tg_send_message_api(token, chat_id, profile_text)
                 return jsonify({'ok': True})
 
             # Help
-            if message_text.startswith('/help'):
-                r = tg_send_message_api(token, chat_id, HELP_TEXT)
-                if not r or not r.ok:
-                    return jsonify(webhook_reply_send_message(chat_id, HELP_TEXT))
+            import re as _re2
+            if _re2.match(r'^/help(?:@\w+)?\b', message_text):
+                tg_send_message_api(token, chat_id, HELP_TEXT)
                 return jsonify({'ok': True})
 
             # Router
@@ -309,9 +307,7 @@ def handle_request():
             if cmd in supported:
                 url = first_url(arg)
                 if not url:
-                    r = tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`")
-                if not r or not r.ok:
-                    return jsonify(webhook_reply_send_message(chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`"))
+                    tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: {cmd} <youtube-url>")
                 return jsonify({'ok': True})
                 # Immediate ack via webhook response
                 threading.Thread(target=process_and_upload, args=(token, chat_id, url, supported[cmd]), daemon=True).start()
@@ -327,10 +323,8 @@ def handle_request():
                 return jsonify({'ok': True})
 
             # Fallback
-            r = tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
-            if not r or not r.ok:
-                return jsonify(webhook_reply_send_message(chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।"))
-            return jsonify({'ok': True})
+            tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
+                return jsonify({'ok': True})
 
     except Exception as e:
         logger.exception('Error: %s', e)
