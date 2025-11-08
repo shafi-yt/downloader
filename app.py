@@ -282,11 +282,13 @@ def handle_request():
 🎬 *ব্যবহার:*
 /ytdlp <url>, /ytdlpa <url>, /pytube <url>, /audio <url>, /360 <url>, /720 <url>, /best <url>
                 """.strip()
-                return jsonify(webhook_reply_send_message(chat_id, profile_text))
+                tg_send_message_api(token, chat_id, profile_text)
+                return jsonify({'ok': True})
 
             # Help
             if message_text.startswith('/help'):
-                return jsonify(webhook_reply_send_message(chat_id, HELP_TEXT))
+                tg_send_message_api(token, chat_id, HELP_TEXT)
+                return jsonify({'ok': True})
 
             # Router
             cmd, arg = parse_cmd(message_text)
@@ -300,7 +302,8 @@ def handle_request():
             if cmd in supported:
                 url = first_url(arg)
                 if not url:
-                    return jsonify(webhook_reply_send_message(chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`"))
+                    tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`")
+                return jsonify({'ok': True})
                 # Immediate ack via webhook response
                 threading.Thread(target=process_and_upload, args=(token, chat_id, url, supported[cmd]), daemon=True).start()
                 return jsonify(webhook_reply_send_message(chat_id, f"⏳ প্রসেসিং শুরু… ({supported[cmd]})"))
@@ -309,10 +312,12 @@ def handle_request():
             url = first_url(message_text)
             if url:
                 threading.Thread(target=process_and_upload, args=(token, chat_id, url, "ytdlp_cli"), daemon=True).start()
-                return jsonify(webhook_reply_send_message(chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)"))
+                tg_send_message_api(token, chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)")
+                return jsonify({'ok': True})
 
             # Fallback
-            return jsonify(webhook_reply_send_message(chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।"))
+            tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
+            return jsonify({'ok': True})
 
     except Exception as e:
         logger.exception('Error: %s', e)
