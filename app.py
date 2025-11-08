@@ -69,6 +69,9 @@ def guess_audio_file(tmpdir: str):
     return guess_file_by_ext(tmpdir, ["m4a", "mp3", "opus", "aac"])
 
 # ---------- YouTube anti-bot helpers ----------
+
+PTF_PO_TOKEN = os.getenv("PTF_PO_TOKEN", "").strip()
+
 COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
 
 def get_cookiefile_path():
@@ -88,7 +91,7 @@ def get_cookiefile_path():
         return None
 
 # ---------- yt-dlp CLI ----------
-def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False):
+def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False, client="android"):
     outtmpl = os.path.join(outdir, safe_filename(title_hint) + ".%(ext)s")
     # Use valid format filters; avoid regex operators that changed in newer yt-dlp
     default_video_fmt = (
@@ -113,8 +116,8 @@ def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=F
         "--restrict-filenames",
         url
     ]
-    # Prefer Android client to reduce bot checks
-    base.extend(["--extractor-args", "youtube:player_client=android"])
+    # Prefer chosen client to reduce bot checks
+    base.extend(["--extractor-args", f"youtube:player_client={client}"])
     if cookiefile:
         base.extend(["--cookies", cookiefile])
     return base
@@ -128,8 +131,15 @@ def run_cli(cmd, cwd):
 
 # ---------- Download methods ----------
 def download_with_ytdlp_cli(url: str, outdir: str, fmt=None):
-    run_cli(ytdlp_cli_cmd(url, outdir, "youtube", fmt=fmt), outdir)
-    return guess_video_file(outdir)
+    last_err = None
+    for client in ("android", "ios", "web_safari"):
+        try:
+            run_cli(ytdlp_cli_cmd(url, outdir, "youtube", fmt=fmt, client=client), outdir)
+            return guess_video_file(outdir)
+        except Exception as e:
+            last_err = e
+            logger.info("yt-dlp CLI with client=%s failed: %s", client, e)
+    raise last_err
 
 def download_audio_cli(url: str, outdir: str):
     run_cli(ytdlp_cli_cmd(url, outdir, "audio", audio=True), outdir)
@@ -138,36 +148,46 @@ def download_audio_cli(url: str, outdir: str):
 def download_with_ytdlp_api(url: str, outdir: str):
     import yt_dlp
     outtmpl = os.path.join(outdir, "youtube.%(ext)s")
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "restrictfilenames": True,
-        "format": "best[ext=mp4][filesize<48M]/best[filesize<48M]",
-        "max_filesize": HARD_LIMIT_BYTES,
-        "merge_output_format": "mp4",
-        "postprocessors": [],
-        "quiet": True,
-        "no_warnings": True,
-        "cookiefile": get_cookiefile_path(),
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return guess_video_file(outdir)
+    last_err = None
+    for client in ("android", "ios", "web_safari"):
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "restrictfilenames": True,
+            "format": "best[ext=mp4][filesize<48M]/best[filesize<48M]",
+            "max_filesize": HARD_LIMIT_BYTES,
+            "merge_output_format": "mp4",
+            "postprocessors": [],
+            "quiet": True,
+            "no_warnings": True,
+            "cookiefile": get_cookiefile_path(),
+            "extractor_args": {"youtube": {"player_client": [client]}},
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return guess_video_file(outdir)
+        except Exception as e:
+            last_err = e
+            logger.info("yt_dlp API with client=%s failed: %s", client, e)
+    raise last_err
 
 def download_with_pytube(url: str, outdir: str):
     try:
         from pytubefix import YouTube
     except Exception:
         from pytube import YouTube  # fallback
-    yt = YouTube(url, use_po_token=True)
+    yt = YouTube(url, use_po_token=True, po_token=PTF_PO_TOKEN or None)
     title = safe_filename(getattr(yt, "title", None) or "youtube")
     stream = (yt.streams.filter(progressive=True, file_extension="mp4", res="480p").first()
               or yt.streams.filter(progressive=True, file_extension="mp4", res="360p").first()
               or yt.streams.filter(progressive=True, file_extension="mp4").order_by("filesize").first())
     if not stream:
         raise RuntimeError("No suitable progressive stream found")
-    fp = stream.download(output_path=outdir, filename=title + ".mp4")
+    try:
+        fp = stream.download(output_path=outdir, filename=title + ".mp4")
+    except EOFError:
+        raise RuntimeError("pytube headless error: EOF while reading. Set PTF_PO_TOKEN or use /ytdlp with cookies.")
     if os.path.getsize(fp) > HARD_LIMIT_BYTES:
         raise RuntimeError("File exceeds ~50MB limit")
     return fp
@@ -213,7 +233,11 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
             tg_send_video_api(bot_token, chat_id, path, caption=f"📥 {mode} ▶ Telegram")
         except Exception as e:
             logger.exception("Processing error")
-            tg_send_message_api(bot_token, chat_id, f"❌ ব্যর্থ: {e}")
+            msg = str(e)
+            if 'Sign in to confirm you’' in msg or 'Sign in to confirm you\u2019' in msg or 'Sign in to confirm' in msg:
+                tg_send_message_api(bot_token, chat_id, "🛑 YouTube anti-bot/consent বাধা পেয়েছি. Render-এ YTDLP_COOKIES_B64 (Netscape cookies.txt Base64) সেট করে আবার চেষ্টা করুন।")
+            else:
+                tg_send_message_api(bot_token, chat_id, f"❌ ব্যর্থ: {e}")
 
 # ---------- Command help ----------
 HELP_TEXT = (
