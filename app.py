@@ -68,19 +68,16 @@ def guess_video_file(tmpdir: str):
 def guess_audio_file(tmpdir: str):
     return guess_file_by_ext(tmpdir, ["m4a", "mp3", "opus", "aac"])
 
-
 # ---------- YouTube anti-bot helpers ----------
 COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
 
 def get_cookiefile_path():
-    \"\"\"Write Netscape-format cookies from base64 env to a temp file, return path or None.\"\"\"
-    global COOKIES_B64
+    """Write Netscape-format cookies from base64 env to a temp file, return path or None."""
     if not COOKIES_B64:
         return None
     try:
         import tempfile, base64
         raw = base64.b64decode(COOKIES_B64.encode("utf-8"))
-        # Persist for process lifetime
         path = os.path.join(tempfile.gettempdir(), "cookies_youtube.txt")
         if not os.path.exists(path) or os.path.getsize(path) != len(raw):
             with open(path, "wb") as f:
@@ -149,10 +146,10 @@ def download_with_ytdlp_api(url: str, outdir: str):
         "max_filesize": HARD_LIMIT_BYTES,
         "merge_output_format": "mp4",
         "postprocessors": [],
-        "cookiefile": get_cookiefile_path(),
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
         "quiet": True,
         "no_warnings": True,
+        "cookiefile": get_cookiefile_path(),
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -205,12 +202,12 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
                 path = download_with_ytdlp_cli(url, tmp)
 
             if not path:
-                tg_send_message_api(bot_token, chat_id, "⚠️ ফাইল খুঁজে পাইনি। অন্য মেথড চেষ্টা করুন (/ytdlpa, /pytube).")
+                tg_send_message_api(bot_token, chat_id, "⚠️ ফাইল খুঁজে পাইনি। অন্য মেথড চেষ্টা করুন (/ytdlpa, /pytube)." )
                 return
 
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > (TARGET_LIMIT_MB - 0.5):
-                tg_send_message_api(bot_token, chat_id, f"⚠️ ফাইল {size_mb:.1f}MB — সীমা পার হচ্ছে। `/360` বা `/audio` চেষ্টা করুন।")
+                tg_send_message_api(bot_token, chat_id, f"⚠️ ফাইল {size_mb:.1f}MB — সীমা পার হচ্ছে। /360 বা /audio চেষ্টা করুন।")
                 return
 
             tg_send_video_api(bot_token, chat_id, path, caption=f"📥 {mode} ▶ Telegram")
@@ -243,7 +240,7 @@ def first_url(s: str):
     m = YOUTUBE_RE.search(s or "")
     return m.group(0) if m else None
 
-# ---------- Single endpoint (GET/POST) with ?token=BOT_TOKEN ----------
+# ---------- Single endpoint (GET/HEAD/POST) with ?token=BOT_TOKEN ----------
 @app.route('/', methods=['GET', 'HEAD', 'POST'])
 def handle_request():
     try:
@@ -267,16 +264,11 @@ def handle_request():
 
         logger.info("Update received: %s", json.dumps(update)[:2000])
 
-        chat_id = None
-        message_text = ''
-        user_info = {}
-
         if 'message' in update:
             msg = update['message']
         elif 'edited_message' in update:
             msg = update['edited_message']
         else:
-            # ignore channel_post etc.
             return jsonify({'ok': True})
 
         chat = msg.get('chat') or {}
