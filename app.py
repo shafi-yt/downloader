@@ -51,7 +51,9 @@ def tg_api_base(bot_token: str) -> str:
 def tg_send_message_api(bot_token: str, chat_id: int, text: str, **kwargs):
     data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", **kwargs}
     try:
-        return requests.post(f"{tg_api_base(bot_token)}/sendMessage", json=data, timeout=30)
+        r = requests.post(f"{tg_api_base(bot_token)}/sendMessage", json=data, timeout=30)
+        logger.info("sendMessage status=%s body=%s", getattr(r, 'status_code', None), getattr(r, 'text', None)[:400])
+        return r
     except Exception as e:
         logger.exception("sendMessage failed: %s", e)
 
@@ -59,13 +61,17 @@ def tg_send_video_api(bot_token: str, chat_id: int, file_path: str, caption: str
     with open(file_path, "rb") as f:
         files = {"video": (os.path.basename(file_path), f, "video/mp4")}
         data = {"chat_id": chat_id, "caption": caption}
-        return requests.post(f"{tg_api_base(bot_token)}/sendVideo", files=files, data=data, timeout=600)
+        r = requests.post(f"{tg_api_base(bot_token)}/sendVideo", files=files, data=data, timeout=600)
+        logger.info("sendVideo status=%s body=%s", getattr(r, 'status_code', None), getattr(r, 'text', None)[:400])
+        return r
 
 def tg_send_audio_api(bot_token: str, chat_id: int, file_path: str, caption: str = ""):
     with open(file_path, "rb") as f:
         files = {"audio": (os.path.basename(file_path), f)}
         data = {"chat_id": chat_id, "caption": caption}
-        return requests.post(f"{tg_api_base(bot_token)}/sendAudio", files=files, data=data, timeout=600)
+        r = requests.post(f"{tg_api_base(bot_token)}/sendAudio", files=files, data=data, timeout=600)
+        logger.info("sendAudio status=%s body=%s", getattr(r, 'status_code', None), getattr(r, 'text', None)[:400])
+        return r
 
 # ---------- yt-dlp CLI builders ----------
 def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False):
@@ -228,11 +234,8 @@ def handle_request():
                 'solution': 'Add ?token=YOUR_BOT_TOKEN to URL'
             }), 400
 
-        if request.method == 'GET':
-            return jsonify({
-                'status': 'Bot is running',
-                'token_received': True
-            })
+        if request.method in ('GET', 'HEAD'):
+            return jsonify({'status': 'Bot is running', 'note': 'Provide ?token=BOT_TOKEN for incoming updates'})
 
         if request.method == 'POST':
             update = request.get_json()
@@ -282,12 +285,16 @@ def handle_request():
 🎬 *ব্যবহার:*
 /ytdlp <url>, /ytdlpa <url>, /pytube <url>, /audio <url>, /360 <url>, /720 <url>, /best <url>
                 """.strip()
-                tg_send_message_api(token, chat_id, profile_text)
+                r = tg_send_message_api(token, chat_id, profile_text)
+                if not r or not r.ok:
+                    return jsonify(webhook_reply_send_message(chat_id, profile_text))
                 return jsonify({'ok': True})
 
             # Help
             if message_text.startswith('/help'):
-                tg_send_message_api(token, chat_id, HELP_TEXT)
+                r = tg_send_message_api(token, chat_id, HELP_TEXT)
+                if not r or not r.ok:
+                    return jsonify(webhook_reply_send_message(chat_id, HELP_TEXT))
                 return jsonify({'ok': True})
 
             # Router
@@ -302,7 +309,9 @@ def handle_request():
             if cmd in supported:
                 url = first_url(arg)
                 if not url:
-                    tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`")
+                    r = tg_send_message_api(token, chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`")
+                if not r or not r.ok:
+                    return jsonify(webhook_reply_send_message(chat_id, f"🔗 ব্যবহার: `{cmd}` `<youtube-url>`"))
                 return jsonify({'ok': True})
                 # Immediate ack via webhook response
                 threading.Thread(target=process_and_upload, args=(token, chat_id, url, supported[cmd]), daemon=True).start()
@@ -312,11 +321,15 @@ def handle_request():
             url = first_url(message_text)
             if url:
                 threading.Thread(target=process_and_upload, args=(token, chat_id, url, "ytdlp_cli"), daemon=True).start()
-                tg_send_message_api(token, chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)")
+                r = tg_send_message_api(token, chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)")
+                if not r or not r.ok:
+                    return jsonify(webhook_reply_send_message(chat_id, "⏳ প্রসেসিং শুরু… (ytdlp_cli)"))
                 return jsonify({'ok': True})
 
             # Fallback
-            tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
+            r = tg_send_message_api(token, chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।")
+            if not r or not r.ok:
+                return jsonify(webhook_reply_send_message(chat_id, "❓ কমান্ড/লিংক বুঝিনি। `/help` দেখুন।"))
             return jsonify({'ok': True})
 
     except Exception as e:
