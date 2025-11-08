@@ -68,6 +68,28 @@ def guess_video_file(tmpdir: str):
 def guess_audio_file(tmpdir: str):
     return guess_file_by_ext(tmpdir, ["m4a", "mp3", "opus", "aac"])
 
+
+# ---------- YouTube anti-bot helpers ----------
+COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+
+def get_cookiefile_path():
+    \"\"\"Write Netscape-format cookies from base64 env to a temp file, return path or None.\"\"\"
+    global COOKIES_B64
+    if not COOKIES_B64:
+        return None
+    try:
+        import tempfile, base64
+        raw = base64.b64decode(COOKIES_B64.encode("utf-8"))
+        # Persist for process lifetime
+        path = os.path.join(tempfile.gettempdir(), "cookies_youtube.txt")
+        if not os.path.exists(path) or os.path.getsize(path) != len(raw):
+            with open(path, "wb") as f:
+                f.write(raw)
+        return path
+    except Exception as e:
+        logger.exception("Failed to load cookies from YTDLP_COOKIES_B64: %s", e)
+        return None
+
 # ---------- yt-dlp CLI ----------
 def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=False):
     outtmpl = os.path.join(outdir, safe_filename(title_hint) + ".%(ext)s")
@@ -84,6 +106,7 @@ def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=F
     else:
         fmt = fmt or default_video_fmt
 
+    cookiefile = get_cookiefile_path()
     base = [
         "yt-dlp",
         "-o", outtmpl,
@@ -93,6 +116,10 @@ def ytdlp_cli_cmd(url: str, outdir: str, title_hint="youtube", fmt=None, audio=F
         "--restrict-filenames",
         url
     ]
+    # Prefer Android client to reduce bot checks
+    base.extend(["--extractor-args", "youtube:player_client=android"])
+    if cookiefile:
+        base.extend(["--cookies", cookiefile])
     return base
 
 def run_cli(cmd, cwd):
@@ -122,6 +149,8 @@ def download_with_ytdlp_api(url: str, outdir: str):
         "max_filesize": HARD_LIMIT_BYTES,
         "merge_output_format": "mp4",
         "postprocessors": [],
+        "cookiefile": get_cookiefile_path(),
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
         "quiet": True,
         "no_warnings": True,
     }
@@ -134,7 +163,7 @@ def download_with_pytube(url: str, outdir: str):
         from pytubefix import YouTube
     except Exception:
         from pytube import YouTube  # fallback
-    yt = YouTube(url)
+    yt = YouTube(url, use_po_token=True)
     title = safe_filename(getattr(yt, "title", None) or "youtube")
     stream = (yt.streams.filter(progressive=True, file_extension="mp4", res="480p").first()
               or yt.streams.filter(progressive=True, file_extension="mp4", res="360p").first()
