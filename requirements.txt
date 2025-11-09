@@ -1,0 +1,5 @@
+Flask==3.0.3
+requests==2.32.3
+yt-dlp==2024.10.22
+pytube==15.0.0
+pydub==0.25.1
