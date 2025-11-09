@@ -12,7 +12,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1950"))
 # default quality (can be overridden by QUALITY env)
-QUALITY = os.environ.get("QUALITY", "720p")
+QUALITY = os.environ.get("QUALITY", "360p")
 # Hardcoded default URL; can override with DEFAULT_URL env or by sending a plain text URL later
 DEFAULT_URL = os.environ.get("DEFAULT_URL", "https://youtu.be/BfLPuDRgjPw")
 
