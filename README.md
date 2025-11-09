@@ -1,12 +1,14 @@
-# v8 — Dynamic format selection (<=360p)
+# v9 — Full logs to Telegram + /formats + /debuglog
 
-Fixes `Requested format is not available` by **probing formats** first (`yt-dlp -J`), then choosing:
-1) progressive mp4 <=360p (h264) if available
-2) any progressive <=360p
-3) adaptive best video<=360p (prefer avc1/mp4) + best audio (m4a/aac)
-4) last resort: best single
+- `/debuglog on` → yt-dlp probe & download **every line** streams to chat
+- `/formats` → runs `yt-dlp -J`, sends a summary + attaches `formats.json`
+- On `/start` or URL, bot uploads `probe.log`, `download.log`, and `formats.json` for the job
+- Uses dynamic format selection (<=360p progressive preferred), cookies, UA, android client args
 
-Cookies + UA + android client extractor args included. Temp dir per request, upload then cleanup.
+## Env
+- BOT_TOKEN (required)
+- YT_COOKIES_PATH=cookies.txt (optional but recommended)
+- VERBOSE_CHAT=1 to default verbose on (optional)
 
 ## Webhook
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<YOUR-URL>/?token=<TOKEN>"
