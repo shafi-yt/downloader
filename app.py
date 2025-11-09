@@ -4,8 +4,9 @@ import os, re, tempfile, threading, subprocess, shlex, glob, logging, json, requ
 # ---------- Config ----------
 MAX_FILE_MB = 48
 HARD_LIMIT_BYTES = MAX_FILE_MB * 1024 * 1024
-YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()  # Base64 of Netscape cookies.txt
-PTF_PO_TOKEN = os.getenv("PTF_PO_TOKEN", "").strip()  # optional for pytubefix
+YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()  # Base64 of Netscape cookies.txt (optional)
+# Optional token for pytubefix (some setups)
+PTF_PO_TOKEN = os.getenv("PTF_PO_TOKEN", "").strip()
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -20,7 +21,6 @@ def get_cookiefile_path():
     if not YTDLP_COOKIES_B64:
         return None
     try:
-        import tempfile, base64
         raw = base64.b64decode(YTDLP_COOKIES_B64.encode("utf-8"))
         path = os.path.join(tempfile.gettempdir(), "cookies_youtube.txt")
         # write if missing or changed
@@ -62,23 +62,52 @@ def tg_send_message_api(bot_token: str, chat_id: int, text: str):
         logger.exception("sendMessage failed: %s", e)
 
 def tg_send_video_api(bot_token: str, chat_id: int, file_path: str, caption: str = ""):
-    with open(file_path, "rb") as f:
-        files = {"video": (os.path.basename(file_path), f, "video/mp4")}
-        data = {"chat_id": chat_id, "caption": caption}
-        r = requests.post(f"{tg_api_base(bot_token)}/sendVideo", files=files, data=data, timeout=600)
-        logger.info("sendVideo status=%s body=%s", getattr(r, "status_code", None), getattr(r, "text", None)[:400])
-        return r
+    try:
+        with open(file_path, "rb") as f:
+            files = {"video": (os.path.basename(file_path), f, "video/mp4")}
+            data = {"chat_id": chat_id, "caption": caption}
+            r = requests.post(f"{tg_api_base(bot_token)}/sendVideo", files=files, data=data, timeout=600)
+            logger.info("sendVideo status=%s body=%s", getattr(r, "status_code", None), getattr(r, "text", None)[:400])
+            return r
+    except Exception as e:
+        logger.exception("sendVideo failed: %s", e)
 
 def tg_send_audio_api(bot_token: str, chat_id: int, file_path: str, caption: str = ""):
-    with open(file_path, "rb") as f:
-        files = {"audio": (os.path.basename(file_path), f)}
-        data = {"chat_id": chat_id, "caption": caption}
-        r = requests.post(f"{tg_api_base(bot_token)}/sendAudio", files=files, data=data, timeout=600)
-        logger.info("sendAudio status=%s body=%s", getattr(r, "status_code", None), getattr(r, "text", None)[:400])
-        return r
+    try:
+        with open(file_path, "rb") as f:
+            files = {"audio": (os.path.basename(file_path), f)}
+            data = {"chat_id": chat_id, "caption": caption}
+            r = requests.post(f"{tg_api_base(bot_token)}/sendAudio", files=files, data=data, timeout=600)
+            logger.info("sendAudio status=%s body=%s", getattr(r, "status_code", None), getattr(r, "text", None)[:400])
+            return r
+    except Exception as e:
+        logger.exception("sendAudio failed: %s", e)
 
-# ---------- yt-dlp CLI (Lite) ----------
-def get_ytdlp_base_cmd(url: str, outtmpl: str, fmt: str, cookiefile: str = None, client: str = "android"):
+# ---------- yt-dlp CLI helpers (robust encoding) ----------
+def run_cli(cmd, cwd):
+    logger.info("Running: %s", " ".join(shlex.quote(c) for c in cmd))
+    env = os.environ.copy()
+    env.update({
+        "PYTHONIOENCODING": "utf-8",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "YTDLP_NO_COLOR": "1",
+    })
+    cp = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    logger.info(cp.stdout)
+    if cp.returncode != 0:
+        raise RuntimeError("yt-dlp CLI failed:\n" + (cp.stdout or ""))
+
+def get_ytdlp_cmd(url: str, outtmpl: str, fmt: str, cookiefile: str = None, client: str = "android"):
     cmd = [
         "yt-dlp",
         "-o", outtmpl,
@@ -86,24 +115,17 @@ def get_ytdlp_base_cmd(url: str, outtmpl: str, fmt: str, cookiefile: str = None,
         "--max-filesize", f"{MAX_FILE_MB}M",
         "--no-playlist",
         "--restrict-filenames",
+        "--no-color",
+        "--no-progress",
         url
     ]
-    # extractor client hint and cookies (if provided)
     cmd.extend(["--extractor-args", f"youtube:player_client={client}"])
     if cookiefile:
         cmd.extend(["--cookies", cookiefile])
     return cmd
 
-def run_cli(cmd, cwd):
-    logger.info("Running: %s", " ".join(shlex.quote(c) for c in cmd))
-    cp = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    logger.info(cp.stdout)
-    if cp.returncode != 0:
-        raise RuntimeError("yt-dlp CLI failed:\n" + (cp.stdout or ""))
-
 # ---------- Download methods (Lite) ----------
-def download_with_ytdlp_cli(url: str, outdir: str, fmt=None):
-    # Lite bot: prefer small formats: 360p then 480p then fallback
+def download_with_ytdlp_cli(url: str, outdir: str):
     formats = [
         "best[ext=mp4][height<=360][filesize<48M]",
         "best[ext=mp4][height<=480][filesize<48M]",
@@ -114,25 +136,49 @@ def download_with_ytdlp_cli(url: str, outdir: str, fmt=None):
     for client in ("android", "web_safari"):
         for f in formats:
             outtmpl = os.path.join(outdir, "youtube.%(ext)s")
-            cmd = get_ytdlp_base_cmd(url, outtmpl, f, cookiefile=cookiefile, client=client)
+            cmd = get_ytdlp_cmd(url, outtmpl, f, cookiefile=cookiefile, client=client)
             try:
                 run_cli(cmd, outdir)
                 return guess_video_file(outdir)
             except Exception as e:
                 last_err = e
                 logger.info("yt-dlp attempt client=%s format=%s failed: %s", client, f, e)
-    raise last_err
+    raise last_err if last_err else RuntimeError("yt-dlp attempts failed")
 
 def download_audio_cli(url: str, outdir: str):
     cookiefile = get_cookiefile_path()
-    cmd = get_ytdlp_base_cmd(url, os.path.join(outdir, "audio.%(ext)s"), "bestaudio[ext=m4a][filesize<48M]", cookiefile=cookiefile)
+    outtmpl = os.path.join(outdir, "audio.%(ext)s")
+    cmd = get_ytdlp_cmd(url, outtmpl, "bestaudio[ext=m4a][filesize<48M]", cookiefile=cookiefile, client="android")
     run_cli(cmd, outdir)
     return guess_audio_file(outdir)
 
-# ---------- Process & upload worker ----------
+# ---------- pytubefix fallback ----------
+def download_with_pytubefix(url: str, outdir: str):
+    try:
+        from pytubefix import YouTube
+        yt = YouTube(url, use_po_token=True)
+        # Some versions provide bypass_po_token helper
+        try:
+            yt.bypass_po_token()
+        except Exception:
+            pass
+        title = safe_filename(getattr(yt, "title", None) or "youtube")
+        stream = (yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first())
+        if not stream:
+            raise RuntimeError("No suitable progressive stream found")
+        filepath = stream.download(output_path=outdir, filename=title + ".mp4")
+        if os.path.getsize(filepath) > HARD_LIMIT_BYTES:
+            raise RuntimeError("File exceeds ~50MB limit")
+        return filepath
+    except Exception as e:
+        logger.info("pytubefix failed: %s", e)
+        raise
+
+# ---------- Worker ----------
 def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
     with tempfile.TemporaryDirectory() as tmp:
         try:
+            cookiefile = get_cookiefile_path()
             if mode == "audio":
                 apath = download_audio_cli(url, tmp)
                 if not apath:
@@ -141,32 +187,44 @@ def process_and_upload(bot_token: str, chat_id: int, url: str, mode: str):
                     raise RuntimeError("Audio exceeds limit")
                 tg_send_audio_api(bot_token, chat_id, apath, caption="🎧 Extracted audio")
                 return
-            else:
-                path = download_with_ytdlp_cli(url, tmp)
+            # Try pytubefix first (fast, no separate yt-dlp process)
+            try:
+                logger.info("Trying pytubefix for %s", url)
+                path = download_with_pytubefix(url, tmp)
+            except Exception as e_pyt:
+                logger.info("pytubefix failed, falling back to yt-dlp CLI: %s", e_pyt)
+                # If /360 requested, force smaller format selection by calling download_with_ytdlp_cli loop but with 360 first
+                if mode == "360":
+                    path = download_with_ytdlp_cli(url, tmp)
+                else:
+                    path = download_with_ytdlp_cli(url, tmp)
+
             if not path:
                 tg_send_message_api(bot_token, chat_id, "⚠️ ফাইল খুঁজে পাইনি। অন্য মেথড চেষ্টা করুন।")
                 return
+
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_MB:
                 tg_send_message_api(bot_token, chat_id, f"⚠️ ফাইল {size_mb:.1f}MB — সীমা পার হচ্ছে। /audio বা /360 চেষ্টা করুন।")
                 return
+
             tg_send_video_api(bot_token, chat_id, path, caption="📥 Downloaded (Lite)")
         except Exception as e:
             logger.exception("Processing error")
             msg = str(e)
-            if "Sign in to confirm" in msg or "bot" in msg.lower():
-                tg_send_message_api(bot_token, chat_id, "🛑 YouTube anti-bot detected. Set YTDLP_COOKIES_B64 (Base64 of cookies.txt) in Render env and redeploy.")
+            if "Sign in to confirm" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
+                tg_send_message_api(bot_token, chat_id, "🛑 YouTube anti-bot detected. Set YTDLP_COOKIES_B64 (Base64 of cookies.txt) in service env and redeploy.")
             else:
                 tg_send_message_api(bot_token, chat_id, f"❌ ব্যর্থ: {e}")
 
 # ---------- Help text ----------
 HELP_TEXT = (
-    "👋 Lite bot (360/480 target)\n"
-    "/ytdlp <url> - try to download small MP4 (360/480)\n"
-    "/360 <url> - force 360p\n"
-    "/audio <url> - m4a audio extraction\n"
-    "/start - profile info\n"
-    "/help - this message\n\n"
+    "👋 Lite bot (360/480 target)\\n"
+    "/ytdlp <url> - try to download small MP4 (360/480)\\n"
+    "/360 <url> - force 360p\\n"
+    "/audio <url> - m4a audio extraction\\n"
+    "/start - profile info\\n"
+    "/help - this message\\n\\n"
     "🔒 If YouTube asks to sign in, set YTDLP_COOKIES_B64 env var with your cookies.txt (Base64)."
 )
 
@@ -214,18 +272,18 @@ def handle_request():
 
         # start/help
         if re.match(r'^/start(?:@\w+)?\b', message_text):
-            first_name = user.get('first_name','অজানা')
-            username = user.get('username','অজানা')
+            first_name = user.get('first_name','User')
+            username = user.get('username','unknown')
             profile = f"🤖 Hi {first_name}\\n• username: @{username}\\n• chat_id: {chat_id}\\nUse /ytdlp <url>"
             tg_send_message_api(token, chat_id, profile)
             return jsonify({'ok': True})
 
-        if re.match(r'^/help(?:@\w+)?\b', message_text):
+        if re.match(r'^/help(?:@\w+)?\\b', message_text):
             tg_send_message_api(token, chat_id, HELP_TEXT)
             return jsonify({'ok': True})
 
         cmd, arg = parse_cmd(message_text)
-        supported = {"/ytdlp":"ytdlp", "/360":"ytdlp", "/audio":"audio"}
+        supported = {"/ytdlp":"ytdlp", "/360":"360", "/audio":"audio"}
 
         if cmd in supported:
             url = first_url(arg)
