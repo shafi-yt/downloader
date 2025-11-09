@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: youtube-telegram-flask-webhook
+    name: yt-tg-webhook-v8
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -11,9 +11,5 @@ services:
         sync: false
       - key: DEFAULT_URL
         value: "https://youtu.be/BfLPuDRgjPw"
-      - key: MAX_FILE_MB
-        value: "1950"
-      - key: YT_UA
-        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       - key: YT_COOKIES_PATH
         value: "cookies.txt"
