@@ -2,10 +2,10 @@
 from flask import Flask, request, jsonify
 import os, logging, requests, tempfile, shutil, mimetypes
 
-from downloader import smart_download_video_360, human_size
+from downloader import dynamic_download_360, human_size
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("yt_tg_webhook")
+logger = logging.getLogger("yt_tg_webhook_v8")
 
 app = Flask(__name__)
 
@@ -52,22 +52,24 @@ def health():
     return jsonify({"ok": True, "default_url": DEFAULT_URL, "cookies": have_cookies})
 
 def process_and_upload(token, chat_id, url):
-    have_cookies = bool(os.path.exists(os.environ.get("YT_COOKIES_PATH","cookies.txt")) or os.environ.get("YT_COOKIES_B64"))
-    tg_send_message(token, chat_id, f"Starting 360p download:\n{url}\nCookies: {'ON' if have_cookies else 'OFF'}")
     temp_dir = tempfile.mkdtemp(prefix=f"tg_{chat_id}_")
     try:
-        files = smart_download_video_360(
+        tg_send_message(token, chat_id, "Probing formats (<=360p progressive preferred)…")
+        files = dynamic_download_360(
             url, temp_dir,
-            progress_cb=lambda ln: (("[download]" in ln or "Merging formats" in ln or "Destination" in ln or "ERROR" in ln) and tg_send_message(token, chat_id, ln[:400]))
+            progress_cb=lambda ln: (("[download]" in ln or "Merging formats" in ln or "Destination" in ln or "ERROR" in ln) and tg_send_message(token, chat_id, ln[:380]))
         )
         if not files:
-            tg_send_message(token, chat_id, "Failed after all attempts. If you saw a sign-in/consent wall, paste cookies into cookies.txt.")
+            tg_send_message(token, chat_id, "Failed to download any available format.")
             return
 
         max_bytes = MAX_FILE_MB * 1024 * 1024
         sent = 0
         for p in files:
-            size=os.path.getsize(p)
+            try:
+                size=os.path.getsize(p)
+            except FileNotFoundError:
+                continue
             if size<=max_bytes:
                 if is_video(p):
                     tg_send_video(token, chat_id, p)
@@ -90,7 +92,7 @@ def webhook():
 
     if request.method=="GET":
         have_cookies = bool(os.path.exists(os.environ.get("YT_COOKIES_PATH","cookies.txt")) or os.environ.get("YT_COOKIES_B64"))
-        return jsonify({"status":"ok","default_url": DEFAULT_URL, "quality":"360p", "cookies": have_cookies})
+        return jsonify({"status":"ok","default_url": DEFAULT_URL, "quality":"<=360p dynamic", "cookies": have_cookies})
     update = request.get_json(silent=True)
     if not update:
         return jsonify({"ok": True})
@@ -109,7 +111,7 @@ def webhook():
         process_and_upload(token, chat_id, text.strip())
         return jsonify({"ok": True})
 
-    tg_send_message(token, chat_id, "Send /start to download the default video (360p), or send any YouTube URL.")
+    tg_send_message(token, chat_id, "Send /start to download the default video (<=360p), or send any YouTube URL.")
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
