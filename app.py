@@ -1,30 +1,27 @@
 
 from flask import Flask, request, jsonify
-import os, logging, json, re, requests
+import os, logging, re, requests, mimetypes, tempfile, shutil
 from typing import Dict
 
-from downloader import (ytdlp_download, pytube_download, ensure_dir, human_size, has_ffmpeg)
+from downloader import (smart_download, ensure_dir, human_size, has_ffmpeg)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("flask_yt_pytube")
+logger = logging.getLogger("flask_yt_pytube_v3_tmpdl")
 
 app = Flask(__name__)
 
 BOT_TOKEN_ENV = os.environ.get("BOT_TOKEN")
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1950"))
-ensure_dir(DOWNLOAD_DIR)
 
-URL_RE = re.compile(r"https?://\S+")
+URL_RE = re.compile(r"https?://\\S+")
 
-# per-chat in-memory settings
 class Settings:
     def __init__(self):
-        self.engine = "yt-dlp"   # or 'pytube'
-        self.mode = "video"      # 'video' or 'audio'
-        self.quality = "best"    # best/1080p/720p/480p/360p
-        self.playlist = False    # yt-dlp only
-        self.to_mp3 = True       # when audio
+        self.engine = "yt-dlp"
+        self.mode = "video"
+        self.quality = "1080p"
+        self.playlist = False
+        self.to_mp3 = True
 
 USER_SETTINGS: Dict[int, Settings] = {}
 
@@ -42,7 +39,7 @@ def tg_send_message(token, chat_id, text, reply_markup=None, parse_mode="Markdow
     if reply_markup:
         payload["reply_markup"]=reply_markup
     try:
-        requests.post(tg_api(token, "sendMessage"), json=payload, timeout=15)
+        requests.post(tg_api(token, "sendMessage"), json=payload, timeout=20)
     except Exception as e:
         logger.error(f"sendMessage failed: {e}")
 
@@ -55,9 +52,22 @@ def tg_send_document(token, chat_id, file_path, caption=None):
     except Exception as e:
         logger.error(f"sendDocument failed: {e}")
 
+def tg_send_video(token, chat_id, file_path, caption=None):
+    try:
+        with open(file_path, "rb") as f:
+            files={"video": (os.path.basename(file_path), f)}
+            data={"chat_id": chat_id, "caption": caption or os.path.basename(file_path)}
+            requests.post(tg_api(token, "sendVideo"), data=data, files=files, timeout=600)
+    except Exception as e:
+        logger.error(f"sendVideo failed: {e}")
+
+def guess_is_video(path:str)->bool:
+    mt, _ = mimetypes.guess_type(path)
+    if mt and mt.startswith("video/"):
+        return True
+    return os.path.splitext(path)[1].lower() in {".mp4",".mkv",".webm",".mov",".avi"}
+
 def keyboards(settings:Settings):
-    # inline keyboard with callback_data handled locally via text commands for simplicity
-    # We'll simulate buttons by sending quick command hints.
     kb = {
         "inline_keyboard": [
             [
@@ -80,8 +90,7 @@ def keyboards(settings:Settings):
                  "callback_data": "playlist:toggle"},
             ],
             [
-                {"text": ("✅ " if settings.to_mp3 else "") + ("MP3" if has_ffmpeg() else "MP3 (needs ffmpeg)"),
-                 "callback_data": "mp3:toggle"},
+                {"text": ("✅ " if settings.to_mp3 else "") + "MP3", "callback_data": "mp3:toggle"},
             ],
         ]
     }
@@ -104,10 +113,9 @@ def apply_button(chat_id:int, data:str):
 
 @app.route("/", methods=["GET","POST"])
 def webhook():
-    # token can come from query or env
     token = request.args.get("token") or BOT_TOKEN_ENV
     if not token:
-        return jsonify({"error":"Token required","solution":"Add ?token=YOUR_BOT_TOKEN or set BOT_TOKEN env"}), 400
+        return jsonify({"error":"Token required","solution":"Add ?token=YOUR_BOT_TOKEN or set BOT_TOKEN"}), 400
 
     if request.method=="GET":
         return jsonify({
@@ -122,7 +130,7 @@ def webhook():
 
     logger.info(f"Update: {update}")
 
-    # callback query (buttons)
+    # Buttons
     if "callback_query" in update:
         cq = update["callback_query"]
         chat_id = cq["message"]["chat"]["id"]
@@ -140,10 +148,9 @@ def webhook():
 
     s = get_settings(chat_id)
 
-    # commands
     if text.startswith("/start"):
         tg_send_message(token, chat_id,
-                        "Send a URL and choose options.\nYou can tap buttons to change defaults.",
+                        "Send a URL and choose options. I download to a temporary folder, upload to Telegram, then delete files.",
                         reply_markup=keyboards(s))
         return jsonify({"ok": True})
 
@@ -151,56 +158,61 @@ def webhook():
         tg_send_message(token, chat_id, "Adjust settings:", reply_markup=keyboards(s))
         return jsonify({"ok": True})
 
-    # treat as URL
-    m = URL_RE.search(text)
+    m = URL_RE.search(text or "")
     if not m:
         tg_send_message(token, chat_id, "Please send a valid URL or use /settings")
         return jsonify({"ok": True})
 
     url = m.group(0)
-    tg_send_message(token, chat_id, f"Got URL.\nEngine: {s.engine}\nMode: {s.mode}\nQuality: {s.quality}\nPlaylist: {s.playlist}\nTo MP3: {s.to_mp3 and s.mode=='audio'}\nWorking…")
-
-    out_dir = os.path.join(DOWNLOAD_DIR, str(chat_id))
-    ensure_dir(out_dir)
     audio_only = (s.mode=="audio")
+    tg_send_message(token, chat_id, f"Got URL.\nEngine: {s.engine} (auto-fallback enabled)\nMode: {s.mode}\nQuality: {s.quality}\nPlaylist: {s.playlist}\nTo MP3: {s.to_mp3 and audio_only}\nWorking…")
 
-    files=[]
+    # --- Temporary folder per request ---
+    temp_dir = tempfile.mkdtemp(prefix=f"tg_{chat_id}_")
     try:
-        if s.engine=="yt-dlp":
-            files = ytdlp_download(url, out_dir, quality=s.quality, audio_only=audio_only, to_mp3=s.to_mp3 and audio_only, playlist=s.playlist,
-                                   progress_cb=lambda ln: (('[download]' in ln) and tg_send_message(token, chat_id, ln[:200])))
-        else:
+        def progress(line:str):
+            if "[download]" in line or "Merging formats" in line or "Destination" in line:
+                tg_send_message(token, chat_id, line[:200])
+
+        files = smart_download(url, temp_dir, quality=s.quality, audio_only=audio_only, to_mp3=(s.to_mp3 and audio_only), playlist=s.playlist, progress_cb=progress)
+
+        if not files:
+            tg_send_message(token, chat_id, "No output files were produced after all attempts 🤔")
+            return jsonify({"ok": True})
+
+        max_bytes = MAX_FILE_MB * 1024 * 1024
+        sent = 0
+        for p in files:
             try:
-                files = pytube_download(url, out_dir, quality=s.quality, audio_only=audio_only, to_mp3=s.to_mp3 and audio_only,
-                                        progress_cb=None)
-            except Exception as e:
-                tg_send_message(token, chat_id, f"pytube failed: {e}\nFalling back to yt-dlp…")
-                files = ytdlp_download(url, out_dir, quality=s.quality, audio_only=audio_only, to_mp3=s.to_mp3 and audio_only, playlist=False,
-                                       progress_cb=lambda ln: (('[download]' in ln) and tg_send_message(token, chat_id, ln[:200])))
-    except Exception as e:
-        tg_send_message(token, chat_id, f"Download error: {e}")
-        return jsonify({"ok": True})
-
-    if not files:
-        tg_send_message(token, chat_id, "No output files were produced 🤔")
-        return jsonify({"ok": True})
-
-    max_bytes = MAX_FILE_MB * 1024 * 1024
-    sent=0
-    for p in files:
+                size=os.path.getsize(p)
+            except FileNotFoundError:
+                continue
+            if size<=max_bytes:
+                if not audio_only and guess_is_video(p):
+                    tg_send_video(token, chat_id, p, caption=os.path.basename(p))
+                else:
+                    tg_send_document(token, chat_id, p, caption=os.path.basename(p))
+                sent+=1
+            else:
+                tg_send_message(token, chat_id, f"⚠️ Skipped {os.path.basename(p)} — size {human_size(size)} exceeds limit {MAX_FILE_MB} MB. Try lower quality (/settings).")
+        if sent==0:
+            tg_send_message(token, chat_id, "Nothing uploaded (files too large?). Try lower quality.")
+    finally:
+        # Cleanup temporary directory
         try:
-            size=os.path.getsize(p)
-        except FileNotFoundError:
-            continue
-        if size<=max_bytes:
-            tg_send_document(token, chat_id, p, caption=os.path.basename(p))
-            sent+=1
-        else:
-            tg_send_message(token, chat_id, f"⚠️ Skipped {os.path.basename(p)} — size {human_size(size)} exceeds limit {MAX_FILE_MB} MB.")
-    if sent==0:
-        tg_send_message(token, chat_id, "Nothing uploaded (files too large?). Try lower quality.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Temp cleanup failed: {e}")
 
     return jsonify({"ok": True})
+
+# helpers used above
+import mimetypes
+def guess_is_video(path:str)->bool:
+    mt, _ = mimetypes.guess_type(path)
+    if mt and mt.startswith("video/"):
+        return True
+    return os.path.splitext(path)[1].lower() in {".mp4",".mkv",".webm",".mov",".avi"}
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT", 10000))
