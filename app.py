@@ -2,10 +2,10 @@
 from flask import Flask, request, jsonify
 import os, logging, requests, tempfile, shutil, mimetypes
 
-from downloader import smart_download_video_default360, human_size
+from downloader import smart_download_video_360, human_size
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("autostart_v5")
+logger = logging.getLogger("yt_tg_webhook")
 
 app = Flask(__name__)
 
@@ -48,18 +48,20 @@ def is_video(path:str)->bool:
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "default_url": DEFAULT_URL})
+    have_cookies = bool(os.path.exists(os.environ.get("YT_COOKIES_PATH","cookies.txt")) or os.environ.get("YT_COOKIES_B64"))
+    return jsonify({"ok": True, "default_url": DEFAULT_URL, "cookies": have_cookies})
 
 def process_and_upload(token, chat_id, url):
-    tg_send_message(token, chat_id, f"Starting download (360p default):\n{url}")
+    have_cookies = bool(os.path.exists(os.environ.get("YT_COOKIES_PATH","cookies.txt")) or os.environ.get("YT_COOKIES_B64"))
+    tg_send_message(token, chat_id, f"Starting 360p download:\n{url}\nCookies: {'ON' if have_cookies else 'OFF'}")
     temp_dir = tempfile.mkdtemp(prefix=f"tg_{chat_id}_")
     try:
-        files = smart_download_video_default360(
+        files = smart_download_video_360(
             url, temp_dir,
             progress_cb=lambda ln: (("[download]" in ln or "Merging formats" in ln or "Destination" in ln or "ERROR" in ln) and tg_send_message(token, chat_id, ln[:400]))
         )
         if not files:
-            tg_send_message(token, chat_id, "Failed after all attempts 🤔 (pytube + yt-dlp).")
+            tg_send_message(token, chat_id, "Failed after all attempts. If you saw a sign-in/consent wall, paste cookies into cookies.txt.")
             return
 
         max_bytes = MAX_FILE_MB * 1024 * 1024
@@ -74,7 +76,6 @@ def process_and_upload(token, chat_id, url):
                 sent+=1
             else:
                 tg_send_message(token, chat_id, f"⚠️ Skipped {os.path.basename(p)} — size {human_size(size)} > limit {MAX_FILE_MB} MB.")
-
         if sent==0:
             tg_send_message(token, chat_id, "Nothing uploaded (files too large?).")
     finally:
@@ -88,8 +89,8 @@ def webhook():
         return jsonify({"error":"Token required","solution":"Add ?token=YOUR_BOT_TOKEN or set BOT_TOKEN"}), 400
 
     if request.method=="GET":
-        return jsonify({"status":"ok","default_url": DEFAULT_URL, "quality":"360p (pytube-first)",
-                        "webhook_example": f"https://api.telegram.org/bot{token}/setWebhook?url=https://YOUR-DOMAIN?token={token}"})
+        have_cookies = bool(os.path.exists(os.environ.get("YT_COOKIES_PATH","cookies.txt")) or os.environ.get("YT_COOKIES_B64"))
+        return jsonify({"status":"ok","default_url": DEFAULT_URL, "quality":"360p", "cookies": have_cookies})
     update = request.get_json(silent=True)
     if not update:
         return jsonify({"ok": True})
